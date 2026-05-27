@@ -23,7 +23,10 @@ services:
     restart: unless-stopped
 
   backend:
-    image: dragon730/cloudpaste-backend:latest
+    build:
+      context: .
+      dockerfile: docker/backend/Dockerfile
+    image: cloudpaste-backend:local
     environment:
       - NODE_ENV=production
       - PORT=8787
