@@ -120,6 +120,8 @@ export class ObjectStore {
   }
 
   async uploadDirect({ storage_config_id, directory, filename, bodyStream, size, contentType, uploadId = null, userIdOrInfo = null, userType = null }) {
+    const startedAt = Date.now();
+    console.log(`[SHARE_UPLOAD][objectStore] start filename=${filename} size=${size || 0} storageConfigId=${storage_config_id} directory=${directory || "/"} uploadId=${uploadId || "none"}`);
     const storageConfig = await this._getStorageConfig(storage_config_id);
     if (!storageConfig.storage_type) {
       throw new ValidationError("存储配置缺少 storage_type");
@@ -136,16 +138,24 @@ export class ObjectStore {
 
     const key = await this._composeKeyWithStrategy(storageConfig, directory, filename);
 
-    const result = await driver.uploadFile(key, /** @type {any} */ (bodyStream), {
-      path: key,
-      subPath: key,
-      db: this.db,
-      contentType,
-      contentLength: size,
-      uploadId: uploadId || undefined,
-      userIdOrInfo,
-      userType,
-    });
+    console.log(`[SHARE_UPLOAD][objectStore] driver.uploadFile start filename=${filename} key=${key} storageType=${storageConfig.storage_type}`);
+    let result;
+    try {
+      result = await driver.uploadFile(key, /** @type {any} */ (bodyStream), {
+        path: key,
+        subPath: key,
+        db: this.db,
+        contentType,
+        contentLength: size,
+        uploadId: uploadId || undefined,
+        userIdOrInfo,
+        userType,
+      });
+      console.log(`[SHARE_UPLOAD][objectStore] driver.uploadFile success filename=${filename} key=${key} durationMs=${Date.now() - startedAt}`);
+    } catch (error) {
+      console.warn(`[SHARE_UPLOAD][objectStore] driver.uploadFile failed filename=${filename} key=${key} durationMs=${Date.now() - startedAt} error=${error?.name || "Error"} message=${error?.message || error}`);
+      throw error;
+    }
 
     // 触发与存储配置相关的缓存失效（清理URL缓存，联动关联挂载目录缓存）
     try {

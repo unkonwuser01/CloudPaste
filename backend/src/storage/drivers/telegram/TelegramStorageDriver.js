@@ -560,6 +560,7 @@ export class TelegramStorageDriver extends BaseDriver {
 
   async uploadFile(subPath, fileOrStream, ctx = {}) {
     this._ensureInitialized();
+    const startedAt = Date.now();
     const db = ctx?.db || null;
     if (!db) throw new ValidationError("TELEGRAM.uploadFile: 缺少 db");
 
@@ -591,7 +592,9 @@ export class TelegramStorageDriver extends BaseDriver {
       });
     }
 
+    console.log(`[SHARE_UPLOAD][telegram.uploadFile] start filename=${filename} subPath=${subPath} contentLength=${contentLength || 0} contentType=${contentType || "unknown"}`);
     const blob = await this._toBlob(fileOrStream, { contentType, filename });
+    console.log(`[SHARE_UPLOAD][telegram.uploadFile] toBlob done filename=${filename} blobSize=${blob.size} durationMs=${Date.now() - startedAt}`);
     if (Number.isFinite(this.directUploadMaxBytes) && this.directUploadMaxBytes > 0 && blob.size > this.directUploadMaxBytes) {
       throw new DriverError(`TELEGRAM 单次上传过大：未勾选“自建 Bot API”时（official），直传仅支持 ≤${Math.floor(this.directUploadMaxBytes / (1024 * 1024))}MB；更大的文件请使用“挂载浏览器”的分片上传`, {
         status: ApiStatus.BAD_REQUEST,
@@ -601,7 +604,9 @@ export class TelegramStorageDriver extends BaseDriver {
       });
     }
 
+    console.log(`[SHARE_UPLOAD][telegram.uploadFile] sendDocument about to start filename=${filename} blobSize=${blob.size} durationMs=${Date.now() - startedAt}`);
     const sendRes = await this._sendDocument(blob, { filename, contentType });
+    console.log(`[SHARE_UPLOAD][telegram.uploadFile] sendDocument returned filename=${filename} messageId=${sendRes.messageId} durationMs=${Date.now() - startedAt}`);
 
     const manifest = {
       kind: "telegram_manifest_v1",
@@ -980,26 +985,38 @@ export class TelegramStorageDriver extends BaseDriver {
   }
 
   async _toBlob(fileOrStream, { contentType, filename }) {
+    const startedAt = Date.now();
+    console.log(`[SHARE_UPLOAD][telegram.toBlob] start filename=${filename || "upload.bin"} inputType=${fileOrStream?.constructor?.name || typeof fileOrStream}`);
     // File/Blob
     if (typeof Blob !== "undefined" && fileOrStream instanceof Blob) {
+      console.log(`[SHARE_UPLOAD][telegram.toBlob] blob passthrough filename=${filename || "upload.bin"} size=${fileOrStream.size || 0} durationMs=${Date.now() - startedAt}`);
       return fileOrStream;
     }
 
     // ArrayBuffer / Uint8Array / Buffer
     if (fileOrStream instanceof ArrayBuffer) {
-      return new Blob([fileOrStream], { type: contentType || "application/octet-stream" });
+      const blob = new Blob([fileOrStream], { type: contentType || "application/octet-stream" });
+      console.log(`[SHARE_UPLOAD][telegram.toBlob] from ArrayBuffer filename=${filename || "upload.bin"} size=${blob.size} durationMs=${Date.now() - startedAt}`);
+      return blob;
     }
     if (fileOrStream instanceof Uint8Array) {
-      return new Blob([fileOrStream], { type: contentType || "application/octet-stream" });
+      const blob = new Blob([fileOrStream], { type: contentType || "application/octet-stream" });
+      console.log(`[SHARE_UPLOAD][telegram.toBlob] from Uint8Array filename=${filename || "upload.bin"} size=${blob.size} durationMs=${Date.now() - startedAt}`);
+      return blob;
     }
     if (typeof Buffer !== "undefined" && Buffer.isBuffer?.(fileOrStream)) {
-      return new Blob([fileOrStream], { type: contentType || "application/octet-stream" });
+      const blob = new Blob([fileOrStream], { type: contentType || "application/octet-stream" });
+      console.log(`[SHARE_UPLOAD][telegram.toBlob] from Buffer filename=${filename || "upload.bin"} size=${blob.size} durationMs=${Date.now() - startedAt}`);
+      return blob;
     }
 
     // Web ReadableStream
     if (fileOrStream && typeof fileOrStream.getReader === "function") {
+      console.log(`[SHARE_UPLOAD][telegram.toBlob] reading WebStream filename=${filename || "upload.bin"}`);
       const buf = await this._readWebStreamToUint8Array(fileOrStream);
-      return new Blob([buf], { type: contentType || "application/octet-stream" });
+      const blob = new Blob([buf], { type: contentType || "application/octet-stream" });
+      console.log(`[SHARE_UPLOAD][telegram.toBlob] from WebStream filename=${filename || "upload.bin"} size=${blob.size} durationMs=${Date.now() - startedAt}`);
+      return blob;
     }
 
     // Node Readable（兜底：读入内存）
@@ -1009,11 +1026,15 @@ export class TelegramStorageDriver extends BaseDriver {
         chunks.push(typeof chunk === "string" ? Buffer.from(chunk) : chunk);
       }
       const buf = typeof Buffer !== "undefined" ? Buffer.concat(chunks) : new Uint8Array([]);
-      return new Blob([buf], { type: contentType || "application/octet-stream" });
+      const blob = new Blob([buf], { type: contentType || "application/octet-stream" });
+      console.log(`[SHARE_UPLOAD][telegram.toBlob] from NodeReadable filename=${filename || "upload.bin"} chunks=${chunks.length} size=${blob.size} durationMs=${Date.now() - startedAt}`);
+      return blob;
     }
 
     if (typeof fileOrStream === "string") {
-      return new Blob([fileOrStream], { type: contentType || "application/octet-stream" });
+      const blob = new Blob([fileOrStream], { type: contentType || "application/octet-stream" });
+      console.log(`[SHARE_UPLOAD][telegram.toBlob] from string filename=${filename || "upload.bin"} size=${blob.size} durationMs=${Date.now() - startedAt}`);
+      return blob;
     }
 
     throw new ValidationError(`TELEGRAM.uploadFile: 不支持的上传体类型（filename=${filename || ""}）`);

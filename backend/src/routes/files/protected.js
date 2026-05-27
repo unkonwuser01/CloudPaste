@@ -7,10 +7,12 @@ import {
   updateFile,
 } from "../../services/fileService.js";
 import { invalidateFsCache } from "../../cache/invalidation.js";
+import { VfsNodesRepository, VFS_ROOT_PARENT_ID } from "../../repositories/VfsNodesRepository.js";
+import { ShareRecordService } from "../../services/share/ShareRecordService.js";
 import { useRepositories } from "../../utils/repositories.js";
 import { ValidationError } from "../../http/errors.js";
 import { getEncryptionSecret } from "../../utils/environmentUtils.js";
-import { getPagination, jsonOk } from "../../utils/common.js";
+import { getPagination, jsonOk, jsonCreated } from "../../utils/common.js";
 import { usePolicy } from "../../security/policies/policies.js";
 import { resolvePrincipal } from "../../security/helpers/principal.js";
 
@@ -19,6 +21,128 @@ const requireFilesAccess = usePolicy("files.manage");
 const getFilesPrincipal = (c) => resolvePrincipal(c, { allowedTypes: [UserType.ADMIN, UserType.API_KEY] });
 
 export const registerFilesProtectedRoutes = (router) => {
+  router.post("/api/files/import/telegram-manifest", requireFilesAccess, async (c) => {
+    const db = c.env.DB;
+    const encryptionSecret = getEncryptionSecret(c);
+    const repositoryFactory = useRepositories(c);
+    const { type: userType, userId, apiKeyInfo } = getFilesPrincipal(c);
+    const body = await c.req.json();
+
+    const storageConfigId = String(body.storage_config_id || body.storageConfigId || "").trim();
+    const manifest = body.manifest;
+    const filename = String(body.filename || "").trim();
+    const directory = String(body.directory || body.dir || "/").trim() || "/";
+    const mimeType = body.mime_type || body.mimeType || "application/octet-stream";
+    const remark = body.remark || "";
+    const slug = body.slug || undefined;
+    const useProxy = typeof body.use_proxy === "boolean" ? body.use_proxy : (typeof body.useProxy === "boolean" ? body.useProxy : undefined);
+    const password = body.password || null;
+    const expiresInHoursRaw = body.expires_in_hours ?? body.expiresInHours ?? 0;
+    const maxViewsRaw = body.max_views ?? body.maxViews ?? 0;
+
+    if (!storageConfigId) throw new ValidationError("缺少 storage_config_id");
+    if (!filename) throw new ValidationError("缺少 filename");
+    if (!manifest || typeof manifest !== "object") throw new ValidationError("缺少 manifest");
+    if (manifest.kind !== "telegram_manifest_v1") throw new ValidationError("manifest.kind 必须是 telegram_manifest_v1");
+    if (!Array.isArray(manifest.parts) || manifest.parts.length === 0) throw new ValidationError("manifest.parts 不能为空");
+
+    const normalizedManifest = {
+      ...manifest,
+      kind: "telegram_manifest_v1",
+      target_chat_id: manifest.target_chat_id ?? manifest.targetChatId ?? null,
+      parts: manifest.parts.map((part, index) => ({
+        ...part,
+        partNo: Number(part?.partNo ?? part?.part_no ?? part?.part ?? ((Number.isFinite(Number(part?.part_index)) ? Number(part?.part_index) : index) + 1)),
+        size: Number(part?.size) || 0,
+        file_id: part?.file_id ?? part?.fileId ?? null,
+        file_unique_id: part?.file_unique_id ?? part?.fileUniqueId ?? null,
+        message_id: part?.message_id ?? part?.messageId ?? part?.telegram_message_id ?? null,
+        chat_id: part?.chat_id ?? part?.chatId ?? part?.target_chat_id ?? manifest.target_chat_id ?? manifest.targetChatId ?? null,
+      })),
+    };
+
+    const storageConfigRepository = repositoryFactory.getStorageConfigRepository();
+    const storageConfig = await storageConfigRepository.findById(storageConfigId);
+    if (!storageConfig) throw new ValidationError("storage_config 不存在");
+    if (String(storageConfig.storage_type) !== "TELEGRAM") throw new ValidationError("storage_config 不是 TELEGRAM 类型");
+
+    const normalizedSize = Number(body.size ?? body.file_size ?? body.fileSize ?? manifest.parts.reduce((sum, part) => sum + (Number(part.size) || 0), 0));
+    const size = Number.isFinite(normalizedSize) ? normalizedSize : 0;
+    const expiresInHours = Number(expiresInHoursRaw) || 0;
+    const maxViews = Number(maxViewsRaw) || 0;
+
+    const ownerType = UserType.ADMIN;
+    const ownerId = String(storageConfig.admin_id || userId || apiKeyInfo?.id || "").trim();
+    if (!ownerId) throw new ValidationError("storage_config 缺少 admin_id，无法确定目录归属");
+
+    const scopeType = "storage_config";
+    const scopeId = String(storageConfig.id);
+    const repo = new VfsNodesRepository(db, null);
+
+    const mountRepository = repositoryFactory.getMountRepository();
+    const mountRows = await mountRepository.findByStorageConfig(storageConfig.id, storageConfig.storage_type).catch(() => []);
+    const mountRow = Array.isArray(mountRows) ? mountRows[0] : null;
+    const mountPath = String(mountRow?.mount_path || "").trim();
+
+    const safeDir = directory.startsWith("/") ? directory : `/${directory}`;
+    let dirPath = safeDir === "/" ? "/" : safeDir.replace(/\/+$/u, "") || "/";
+    if (mountPath && mountPath !== "/" && dirPath === mountPath) {
+      dirPath = "/";
+    } else if (mountPath && mountPath !== "/" && dirPath.startsWith(`${mountPath}/`)) {
+      dirPath = dirPath.slice(mountPath.length) || "/";
+    }
+
+    const ensured = await repo.ensureDirectoryPath({ ownerType, ownerId, scopeType, scopeId, path: dirPath });
+    const node = await repo.createOrUpdateFileNode({
+      ownerType,
+      ownerId,
+      scopeType,
+      scopeId,
+      parentId: ensured?.parentId ?? VFS_ROOT_PARENT_ID,
+      name: filename,
+      mimeType,
+      size,
+      storageType: "TELEGRAM",
+      contentRef: normalizedManifest,
+    });
+
+    const shareRecordService = new ShareRecordService(db, encryptionSecret, repositoryFactory);
+    const shareRecord = await shareRecordService.createShareRecord({
+      storageConfig,
+      fsPath: null,
+      storageSubPath: "",
+      filename,
+      size,
+      remark,
+      userIdOrInfo: userType === UserType.API_KEY ? (apiKeyInfo || userId) : userId,
+      userType,
+      slug,
+      override: false,
+      password,
+      expiresInHours,
+      maxViews,
+      useProxy,
+      mimeType,
+      uploadResult: { storagePath: `vfs:${node.id}` },
+      originalFilenameUsed: true,
+      updateIfExists: true,
+    });
+
+    invalidateFsCache({ storageConfigId: storageConfig.id, reason: "telegram-manifest-import", db });
+
+    return jsonCreated(c, {
+      file: shareRecord,
+      vfs_node: {
+        id: node.id,
+        name: node.name,
+        parent_id: node.parent_id,
+        storage_type: node.storage_type,
+        size: node.size,
+        mime_type: node.mime_type,
+      },
+      manifest: normalizedManifest,
+    }, "Telegram manifest 导入成功");
+  });
   router.get("/api/files", requireFilesAccess, async (c) => {
     const db = c.env.DB;
     const { type: userType, userId, apiKeyInfo } = getFilesPrincipal(c);

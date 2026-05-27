@@ -310,14 +310,16 @@ export class FileShareService {
       originalFilenameUsed: !!originalFilename,
       storageConfig,
       updateIfExists: !useRandom,
-    });
+      });
   }
 
   // 直传
   async uploadDirectToStorageAndShare(filename, bodyStream, fileSize, userIdOrInfo, userType, options = {}) {
     if (!filename) throw new ValidationError("缺少文件名参数");
+    const startedAt = Date.now();
     const normalizedSize = Number(fileSize) || 0;
     if (!bodyStream || normalizedSize <= 0) throw new ValidationError("上传内容为空");
+    console.log(`[SHARE_UPLOAD][service] start filename=${filename} normalizedSize=${normalizedSize} storageConfigId=${options.storage_config_id || "default"} path=${options.path || "/"} uploadId=${options.uploadId || options.upload_id || "none"}`);
     await this._assertSystemMaxUploadSize(normalizedSize);
     const { ObjectStore } = await import("../storage/object/ObjectStore.js");
     const storedFilename = filename;
@@ -349,42 +351,49 @@ export class FileShareService {
       incomingBytes: normalizedSize,
       context: "share-upload-direct",
     });
-    const result = await store.uploadDirect({
-      storage_config_id: cfg.id,
-      directory: options.path || null,
-      filename: storedFilename,
-      bodyStream,
-      size: normalizedSize,
-      contentType: mimeType,
-      uploadId: options.uploadId || null,
-      userIdOrInfo,
-      userType,
-    });
+    console.log(`[SHARE_UPLOAD][service] resolved storage filename=${storedFilename} cfgId=${cfg.id} storageType=${cfg.storage_type} botApiMode=${cfg.bot_api_mode || "n/a"} plannedKey=${plannedKey}`);
+    try {
+      const result = await store.uploadDirect({
+        storage_config_id: cfg.id,
+        directory: options.path || null,
+        filename: storedFilename,
+        bodyStream,
+        size: normalizedSize,
+        contentType: mimeType,
+        uploadId: options.uploadId || null,
+        userIdOrInfo,
+        userType,
+      });
+      console.log(`[SHARE_UPLOAD][service] store.uploadDirect success filename=${storedFilename} durationMs=${Date.now() - startedAt} storagePath=${result.storagePath || plannedKey}`);
 
-    const { shouldUseRandomSuffix } = await import("../utils/common.js");
-    const useRandom = await shouldUseRandomSuffix(this.db).catch(() => false);
-    return await this.records.createShareRecord({
-      mount: null,
-      fsPath: null,
-      storageSubPath: result.storagePath,
-      filename,
-      size: normalizedSize,
-      remark: options.remark || "",
-      userIdOrInfo,
-      userType,
-      slug: options.slug || null,
-      override: Boolean(options.override),
-      password: options.password || null,
-      expiresInHours: options.expiresIn || 0,
-      maxViews: options.maxViews || 0,
-      useProxy: options.useProxy,
-      mimeType,
-      request: options.request || null,
-      uploadResult: { storagePath: result.storagePath, publicUrl: result.publicUrl, etag: result.etag },
-      originalFilenameUsed: Boolean(options.originalFilename),
-      storageConfig: cfg,
-      updateIfExists: !useRandom,
-    });
+      const { shouldUseRandomSuffix } = await import("../utils/common.js");
+      const useRandom = await shouldUseRandomSuffix(this.db).catch(() => false);
+      return await this.records.createShareRecord({
+        mount: null,
+        fsPath: null,
+        storageSubPath: result.storagePath,
+        filename,
+        size: normalizedSize,
+        remark: options.remark || "",
+        userIdOrInfo,
+        userType,
+        slug: options.slug || null,
+        override: Boolean(options.override),
+        password: options.password || null,
+        expiresInHours: options.expiresIn || 0,
+        maxViews: options.maxViews || 0,
+        useProxy: options.useProxy,
+        mimeType,
+        request: options.request || null,
+        uploadResult: { storagePath: result.storagePath, publicUrl: result.publicUrl, etag: result.etag },
+        originalFilenameUsed: Boolean(options.originalFilename),
+        storageConfig: cfg,
+        updateIfExists: !useRandom,
+      });
+    } catch (error) {
+      console.warn(`[SHARE_UPLOAD][service] failed filename=${storedFilename} durationMs=${Date.now() - startedAt} error=${error?.name || "Error"} message=${error?.message || error}`);
+      throw error;
+    }
   }
 
   // 通过 ObjectStore + File/Blob 上传并创建分享记录（多存储通用）

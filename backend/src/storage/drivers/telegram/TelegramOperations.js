@@ -79,13 +79,14 @@ export function safeJsonParse(text) {
 
 export function normalizePartList(manifest) {
   const parts = Array.isArray(manifest?.parts) ? manifest.parts : [];
+  const manifestChatId = manifest?.target_chat_id ?? manifest?.targetChatId ?? null;
   return parts
-    .map((p) => ({
-      partNo: Number(p?.partNo ?? p?.part_no ?? p?.part),
+    .map((p, index) => ({
+      partNo: Number(p?.partNo ?? p?.part_no ?? p?.part ?? ((Number.isFinite(Number(p?.part_index)) ? Number(p?.part_index) : index) + 1)),
       size: Number(p?.size),
       fileId: p?.file_id ?? p?.fileId ?? null,
-      messageId: p?.message_id ?? p?.messageId ?? null,
-      chatId: p?.chat_id ?? p?.chatId ?? null,
+      messageId: p?.message_id ?? p?.messageId ?? p?.telegram_message_id ?? null,
+      chatId: p?.chat_id ?? p?.chatId ?? p?.target_chat_id ?? manifestChatId ?? null,
     }))
     .filter((p) => Number.isFinite(p.partNo) && p.partNo > 0 && p.fileId);
 }
@@ -329,6 +330,10 @@ export async function sendDocument(driver, blob, { filename, contentType } = {})
   const maxAttempts = 4; // 仅用于 429 重试
   const baseDelayMs = 900;
   const safeFilename = filename && String(filename).trim() ? String(filename).trim() : "file.bin";
+  const startedAt = Date.now();
+  const blobSize = Number(blob?.size ?? 0) || 0;
+
+  console.log(`[TELEGRAM][sendDocument] start filename=${safeFilename} size=${blobSize} contentType=${contentType || "unknown"} chatId=${driver.targetChatId}`);
 
   try {
     const { data } = await callTelegramBotApiJson(
@@ -360,6 +365,8 @@ export async function sendDocument(driver, blob, { filename, contentType } = {})
         },
       }
     );
+
+    console.log(`[TELEGRAM][sendDocument] success filename=${safeFilename} size=${blobSize} durationMs=${Date.now() - startedAt}`);
 
     const result = data.result || null;
     const messageId = result?.message_id ?? null;
@@ -426,6 +433,10 @@ export async function sendDocument(driver, blob, { filename, contentType } = {})
     void contentType;
     return { messageId, fileId, fileUniqueId };
   } catch (err) {
+    console.error(
+      `[TELEGRAM][sendDocument] failed filename=${safeFilename} size=${blobSize} durationMs=${Date.now() - startedAt} ` +
+        `errorName=${err?.name || "Error"} errorCode=${err?.code || ""} message=${err?.message || err}`
+    );
     // 兜底：sendDocument 任何失败都不要让上层自动重试
     if (err && typeof err === "object" && typeof err.retryable !== "boolean") {
       err.retryable = false;

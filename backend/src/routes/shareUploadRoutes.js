@@ -186,17 +186,25 @@ router.put("/api/share/upload", requireFilesCreate, async (c) => {
   };
 
   const shareService = new FileShareService(db, encryptionSecret, repositoryFactory);
+  const startedAt = Date.now();
+  console.log(`[SHARE_UPLOAD][route] start filename=${filenameHeader} declaredLength=${declaredLength} contentType=${shareParams.contentType || "unknown"} storageConfigId=${storageConfigId || "default"} uploadId=${uploadId || "none"}`);
 
-  const result = await shareService.uploadDirectToStorageAndShare(
-    filenameHeader,
-    bodyStream,
-    declaredLength,
-    userIdOrInfo,
-    userType,
-    shareParams
-  );
+  try {
+    const result = await shareService.uploadDirectToStorageAndShare(
+      filenameHeader,
+      bodyStream,
+      declaredLength,
+      userIdOrInfo,
+      userType,
+      shareParams
+    );
 
-  return jsonOk(c, result, "文件上传成功");
+    console.log(`[SHARE_UPLOAD][route] success filename=${filenameHeader} declaredLength=${declaredLength} durationMs=${Date.now() - startedAt}`);
+    return jsonOk(c, result, "文件上传成功");
+  } catch (error) {
+    console.warn(`[SHARE_UPLOAD][route] failed filename=${filenameHeader} declaredLength=${declaredLength} durationMs=${Date.now() - startedAt} error=${error?.name || "Error"} message=${error?.message || error}`);
+    throw error;
+  }
 });
 
 // 通用分享上传：通过 ObjectStore + File，多存储通用
