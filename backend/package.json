@@ -39,7 +39,8 @@
     "mime-types": "^3.0.1",
     "node-schedule": "^2.1.1",
     "tsx": "^4.21.0",
-    "webdav": "^5.8.0"
+    "webdav": "^5.8.0",
+    "undici": "^8.3.0"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20251128.0",
