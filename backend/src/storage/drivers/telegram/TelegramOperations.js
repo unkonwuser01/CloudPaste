@@ -12,10 +12,19 @@
 import { ApiStatus } from "../../../constants/index.js";
 import { DriverError, ValidationError } from "../../../http/errors.js";
 import { VfsNodesRepository, VFS_ROOT_PARENT_ID } from "../../../repositories/VfsNodesRepository.js";
+import { Agent } from "node:undici";
 
 // =========================
 // 1) 工具函数
 // =========================
+
+// Telegram 大文件上传：给 Bot API 单独放宽请求超时，避免长时间无响应时触发默认 HeadersTimeoutError
+const TELEGRAM_LONG_REQUEST_TIMEOUT_MS = Number(process.env.TELEGRAM_LONG_REQUEST_TIMEOUT_MS || 30 * 60 * 1000);
+const telegramLongRequestDispatcher = new Agent({
+  headersTimeout: TELEGRAM_LONG_REQUEST_TIMEOUT_MS,
+  bodyTimeout: TELEGRAM_LONG_REQUEST_TIMEOUT_MS,
+  connectTimeout: 60_000,
+});
 
 export function normalizeApiBaseUrl(url) {
   const raw = String(url || "").trim();
@@ -222,7 +231,7 @@ export async function callTelegramBotApiJson(driver, url, makeInit, options = {}
     try {
       const { resp, data } = await withTelegramConcurrency(driver, async () => {
         const init = (typeof makeInit === "function" ? makeInit(attempt) : makeInit) || {};
-        const r = await fetch(url, { ...init, signal });
+        const r = await fetch(url, { ...init, signal, dispatcher: init?.dispatcher || telegramLongRequestDispatcher });
         const d = await r.json().catch(() => null);
         return { resp: r, data: d };
       });
