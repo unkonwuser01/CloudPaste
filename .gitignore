@@ -112,3 +112,4 @@ out
 # Local runtime / backup files
 sql_data/
 docker-compose.yml.bak-*
+notes/storage_config.telegram.backup.*.json
