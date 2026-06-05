@@ -26,7 +26,10 @@ export function getEffectiveMimeType(mimetype, filename) {
     console.log(`getEffectiveMimeType: 使用传入MIME类型 "${mimetype}" (文件: ${filename || "N/A"})`);
     return mimetype;
   }
-  const detectedMime = mime.lookup(filename) || "application/octet-stream";
+  let detectedMime = mime.lookup(filename) || "application/octet-stream";
+  if (detectedMime === "application/mp4") {
+    detectedMime = "video/mp4";
+  }
   console.log(`getEffectiveMimeType: 从文件名 "${filename}" 推断MIME类型 -> "${detectedMime}"`);
   return detectedMime;
 }
