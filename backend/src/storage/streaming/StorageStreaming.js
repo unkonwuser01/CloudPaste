@@ -49,6 +49,114 @@ const isVideoLikeRequest = (request, descriptor, path) => {
   return isLikelyVideoPath(path);
 };
 
+// Android WebDAV/MediaPlayer 兼容：部分播放器（Dalvik/stagefright）在无 Range 首次 GET 时，
+// 对 200 全量响应会立即断开，nginx 侧表现为 200 但 sent bytes=0，导致黑屏/无法播放。
+// 对 WebDAV 视频无 Range 请求返回一个小的首段 206，可促使播放器进入标准分段读取流程。
+const VIDEO_NO_RANGE_INITIAL_206_MIN_BYTES = 50 * 1024 * 1024; // 50MB：只对大视频做无 Range -> 首段 206
+
+const isAndroidVideoProbeRequest = (request, channel, descriptor, path) => {
+  if (channel !== STREAMING_CHANNELS.WEBDAV) return false;
+  if (!isVideoLikeRequest(request, descriptor, path)) return false;
+  const ua = String(request?.headers?.get?.("user-agent") || "").toLowerCase();
+  const isKnownAndroidPlayer =
+    ua.includes("stagefright") ||
+    ua.includes("dalvik") ||
+    ua.includes("android") ||
+    ua.includes("douyinfetcher") ||
+    ua.includes("media3") ||
+    ua.includes("exoplayer") ||
+    ua.includes("okhttp");
+  if (!isKnownAndroidPlayer) return false;
+
+  // stagefright/Dalvik/Android 老播放器直接兼容；DouyinFetcher/Media3/OkHttp 只对大视频启用，避免影响普通小文件下载。
+  if (ua.includes("stagefright") || ua.includes("dalvik") || ua.includes("android")) return true;
+  const size = Number(descriptor?.size || 0);
+  return size >= VIDEO_NO_RANGE_INITIAL_206_MIN_BYTES;
+};
+
+const ANDROID_VIDEO_INITIAL_RANGE_BYTES = 1024 * 1024; // 1MB
+
+// 小 Range 内存缓存：专门服务 Android/WebDAV 视频播放器反复探测头部/尾部的小片段。
+// 不缓存大段（例如 bytes=48-文件末尾），避免内存/磁盘压力。
+const VIDEO_RANGE_CACHE_MAX_BYTES = 4 * 1024 * 1024; // 单片最大 4MB
+const VIDEO_RANGE_CACHE_MAX_ENTRIES = 96;
+const videoRangeCache = new Map(); // key -> { bytes: Uint8Array, ts: number }
+
+const getVideoRangeCacheKey = (descriptor, range, channel) => {
+  if (channel !== STREAMING_CHANNELS.WEBDAV) return null;
+  const path = descriptor?.__streamingPath || "";
+  if (!isLikelyVideoPath(path) && !(String(descriptor?.contentType || "").toLowerCase().startsWith("video/"))) return null;
+  const size = Number(descriptor?.size);
+  const start = Number(range?.start);
+  const end = Number(range?.end);
+  if (!Number.isFinite(size) || size <= 0 || !Number.isFinite(start) || !Number.isFinite(end) || end < start) return null;
+  const len = end - start + 1;
+  if (len <= 0 || len > VIDEO_RANGE_CACHE_MAX_BYTES) return null;
+
+  // 只缓存典型探测片段：文件头部小段，或文件尾部小段。
+  const isHeadProbe = start === 0 || start <= 128;
+  const isTailProbe = end === size - 1 && len <= VIDEO_RANGE_CACHE_MAX_BYTES;
+  if (!isHeadProbe && !isTailProbe) return null;
+
+  return `${path}|${size}|${start}-${end}|${descriptor?.etag || ""}`;
+};
+
+const rememberVideoRangeCache = (key, bytes) => {
+  if (!key || !bytes || bytes.byteLength <= 0 || bytes.byteLength > VIDEO_RANGE_CACHE_MAX_BYTES) return;
+  if (videoRangeCache.has(key)) videoRangeCache.delete(key);
+  videoRangeCache.set(key, { bytes, ts: Date.now() });
+  while (videoRangeCache.size > VIDEO_RANGE_CACHE_MAX_ENTRIES) {
+    const oldest = videoRangeCache.keys().next().value;
+    if (!oldest) break;
+    videoRangeCache.delete(oldest);
+  }
+};
+
+const streamFromBytes = (bytes) =>
+  new ReadableStream({
+    start(controller) {
+      controller.enqueue(bytes);
+      controller.close();
+    },
+  });
+
+const readSmallStreamToBytes = async (stream, maxBytes) => {
+  const webStream =
+    stream && typeof stream.getReader === "function"
+      ? stream
+      : stream && (typeof stream.pipe === "function" || typeof stream.on === "function")
+        ? await wrapNodeReadableToWebStream(stream)
+        : null;
+  if (!webStream) return null;
+  const reader = webStream.getReader();
+  const chunks = [];
+  let total = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value) continue;
+      const chunk = value instanceof Uint8Array ? value : new Uint8Array(value);
+      total += chunk.byteLength;
+      if (total > maxBytes) return null;
+      chunks.push(chunk);
+    }
+  } finally {
+    try {
+      reader.releaseLock?.();
+    } catch {
+      // ignore
+    }
+  }
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return out;
+};
+
 /**
  * 将 Node.js Readable 转换为 Web ReadableStream（用于 Response body）
  * 目标：在 Node/Docker 场景下也能“边读边回”，避免整文件 Buffer.concat 导致大文件一直加载。
@@ -304,6 +412,8 @@ export class StorageStreaming {
       // 验证返回结构
       /** @type {StorageStreamDescriptor} */
       const descriptor = this._adaptToDescriptor(downloadResult);
+      // 给后续 Range 缓存/日志保留规范路径，不改变驱动描述符原有语义。
+      descriptor.__streamingPath = path;
 
       // 3. 评估条件请求
       const { shouldReturn304, shouldReturn412 } = evaluateConditionalHeaders(request, descriptor.etag, descriptor.lastModified);
@@ -456,6 +566,14 @@ export class StorageStreaming {
 
         console.log(`${logPrefix} 返回 206 Partial Content: ${range.start}-${range.end}`);
         return this._create206Reader(descriptor, range, channel);
+      }
+
+      // WebDAV 视频播放器兼容：无 Range 首次 GET 改为返回首段 206，避免大视频 200/0 字节导致播放失败。
+      if (!rangeHeader && descriptor.size > 0 && isAndroidVideoProbeRequest(request, channel, descriptor, path)) {
+        const end = Math.min(descriptor.size - 1, ANDROID_VIDEO_INITIAL_RANGE_BYTES - 1);
+        const ua = String(request?.headers?.get?.("user-agent") || "");
+        console.log(`${logPrefix} 视频无 Range 首次请求，返回首段 206 兼容: 0-${end}, size=${descriptor.size}, ua=${ua}`);
+        return this._create206Reader(descriptor, { start: 0, end, isSatisfiable: true }, channel);
       }
 
       // 5. 正常 200 响应
@@ -698,6 +816,20 @@ export class StorageStreaming {
       async getBody() {
         if (closed) return null;
 
+        const cacheKey = getVideoRangeCacheKey(descriptor, range, channel);
+        if (cacheKey && videoRangeCache.has(cacheKey)) {
+          const cached = videoRangeCache.get(cacheKey);
+          // refresh LRU
+          videoRangeCache.delete(cacheKey);
+          videoRangeCache.set(cacheKey, cached);
+          console.log(`[StorageStreaming][video-cache] HIT ${descriptor.__streamingPath || ""} ${start}-${end} bytes=${cached.bytes.byteLength}`);
+          return {
+            stream: streamFromBytes(cached.bytes),
+            supportsRange: true,
+            async close() {},
+          };
+        }
+
         // 优先使用驱动原生 Range 支持
         if (typeof descriptor.getRange === "function") {
           streamHandle = await descriptor.getRange(range);
@@ -762,6 +894,31 @@ export class StorageStreaming {
             console.log(
               `[StorageStreaming] 上游 Range 兼容模式：status=200 但 Content-Range 存在（按 start 匹配视为 Range 生效）`,
             );
+          }
+
+          // 驱动原生支持 Range。小探测 Range 使用 tee：一边立即回给播放器，一边后台缓存。
+          // 注意：不能先把 1MB 全部读完再响应；慢 Telegram 源会让播放器等不及，nginx 表现为 499 0。
+          if (cacheKey && streamHandle?.stream && typeof streamHandle.stream.tee === "function") {
+            try {
+              const [responseStream, cacheStream] = streamHandle.stream.tee();
+              void (async () => {
+                try {
+                  const bytes = await readSmallStreamToBytes(cacheStream, VIDEO_RANGE_CACHE_MAX_BYTES);
+                  if (bytes && bytes.byteLength > 0) {
+                    rememberVideoRangeCache(cacheKey, bytes);
+                    console.log(`[StorageStreaming][video-cache] MISS->TEE-STORE ${descriptor.__streamingPath || ""} ${start}-${end} bytes=${bytes.byteLength}`);
+                  }
+                } catch (e) {
+                  console.warn(`[StorageStreaming][video-cache] tee store failed ${descriptor.__streamingPath || ""} ${start}-${end}: ${e?.message || String(e)}`);
+                }
+              })();
+              return {
+                ...streamHandle,
+                stream: responseStream,
+              };
+            } catch (e) {
+              console.warn(`[StorageStreaming][video-cache] tee failed ${descriptor.__streamingPath || ""} ${start}-${end}: ${e?.message || String(e)}`);
+            }
           }
 
           // 驱动原生支持 Range，直接返回
