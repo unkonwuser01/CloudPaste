@@ -463,6 +463,27 @@ export class TelegramStorageDriver extends BaseDriver {
         const endByte = Number.isFinite(Number(end)) ? Number(end) : (Number(size) > 0 ? Number(size) - 1 : Number.MAX_SAFE_INTEGER);
 
         const aborter = new AbortController();
+        const activeReaders = new Set();
+        const activeBodies = new Set();
+
+        const abortActiveDownloads = async (reason = "cancel") => {
+          if (!aborter.signal.aborted) aborter.abort();
+          const readerCancels = [];
+          for (const reader of activeReaders) {
+            try {
+              readerCancels.push(reader.cancel?.(reason));
+            } catch {}
+          }
+          const bodyCancels = [];
+          for (const body of activeBodies) {
+            try {
+              bodyCancels.push(body.cancel?.(reason));
+            } catch {}
+          }
+          await Promise.allSettled([...readerCancels, ...bodyCancels]);
+          activeReaders.clear();
+          activeBodies.clear();
+        };
 
         const stream = new ReadableStream({
           start(controller) {
@@ -500,7 +521,7 @@ export class TelegramStorageDriver extends BaseDriver {
                     // 在后台下载大段甚至整个大文件。播放端取消后，上游仍可能持续跑流量。
                     // 因此这里直接取消上游并返回错误，避免“伪 Range”拖出站流量。
                     try {
-                      await resp.body?.cancel?.();
+                      await resp.body?.cancel?.("telegram-range-not-supported");
                     } catch {}
                     throw new DriverError("TELEGRAM Range 未生效，拒绝全量下载兜底", {
                       status: ApiStatus.BAD_GATEWAY,
@@ -511,22 +532,41 @@ export class TelegramStorageDriver extends BaseDriver {
                   }
 
                   const bodyStream = resp.body;
-
+                  activeBodies.add(bodyStream);
                   const reader = bodyStream.getReader();
-                  while (true) {
-                    const { value, done } = await reader.read();
-                    if (done) break;
-                    if (value) controller.enqueue(value);
+                  activeReaders.add(reader);
+                  try {
+                    while (true) {
+                      if (aborter.signal.aborted) {
+                        await reader.cancel?.("telegram-range-aborted");
+                        break;
+                      }
+                      const { value, done } = await reader.read();
+                      if (done) break;
+                      if (value) controller.enqueue(value);
+                    }
+                  } finally {
+                    activeReaders.delete(reader);
+                    activeBodies.delete(bodyStream);
+                    try {
+                      reader.releaseLock?.();
+                    } catch {}
                   }
                 }
-                controller.close();
+                if (!aborter.signal.aborted) controller.close();
               } catch (e) {
-                controller.error(e);
+                if (aborter.signal.aborted) {
+                  try {
+                    controller.close();
+                  } catch {}
+                } else {
+                  controller.error(e);
+                }
               }
             })();
           },
-          cancel() {
-            aborter.abort();
+          async cancel(reason) {
+            await abortActiveDownloads(reason);
           },
         });
 
@@ -534,7 +574,7 @@ export class TelegramStorageDriver extends BaseDriver {
           stream,
           supportsRange: true,
           async close() {
-            aborter.abort();
+            await abortActiveDownloads("stream-handle-close");
           },
         };
       },
