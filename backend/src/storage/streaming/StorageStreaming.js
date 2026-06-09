@@ -134,7 +134,17 @@ const sliceBytesFromTailWindow = (cached, range) => {
   return cached.bytes.slice(offset, offset + len);
 };
 
+const shouldDisableVideoRangeTeeCache = (descriptor, channel) => {
+  if (channel !== STREAMING_CHANNELS.WEBDAV) return false;
+  const path = descriptor?.__streamingPath || "";
+  const storageType = String(descriptor?.storageType || descriptor?.driverType || descriptor?.provider || "").toLowerCase();
+  // Telegram bot-api/TDLib 在客户端取消后仍可能继续下载/缓存大文件。
+  // 不对 Telegram 视频做 tee 后台缓存，避免 cache 分支继续读取上游。
+  return isLikelyVideoPath(path) && (path.startsWith("/tg/") || storageType.includes("telegram"));
+};
+
 const getVideoRangeCacheKey = (descriptor, range, channel) => {
+  if (shouldDisableVideoRangeTeeCache(descriptor, channel)) return null;
   if (channel !== STREAMING_CHANNELS.WEBDAV) return null;
   const path = descriptor?.__streamingPath || "";
   if (!isLikelyVideoPath(path) && !(String(descriptor?.contentType || "").toLowerCase().startsWith("video/"))) return null;
