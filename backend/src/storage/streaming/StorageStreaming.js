@@ -68,19 +68,71 @@ const isAndroidVideoProbeRequest = (request, channel, descriptor, path) => {
     ua.includes("okhttp");
   if (!isKnownAndroidPlayer) return false;
 
-  // stagefright/Dalvik/Android 老播放器直接兼容；DouyinFetcher/Media3/OkHttp 只对大视频启用，避免影响普通小文件下载。
-  if (ua.includes("stagefright") || ua.includes("dalvik") || ua.includes("android")) return true;
-  const size = Number(descriptor?.size || 0);
-  return size >= VIDEO_NO_RANGE_INITIAL_206_MIN_BYTES;
+  // 只对系统老播放器保留“无 Range -> 首段 206”兼容。
+  // Media3/ExoPlayer + OkHttp 对无 Range 请求收到 206 时，部分超大 MP4 会立刻断开，nginx 表现为 206 0，
+  // 反而卡在首探测阶段；DouyinFetcher 自己有 ChunkedRangeDataSource，应该让它按明确 Range 走。
+  if (ua.includes("stagefright") || ua.includes("dalvik")) return true;
+  if (ua.includes("douyinfetcher") || ua.includes("media3") || ua.includes("exoplayer") || ua.includes("okhttp")) return false;
+  if (ua.includes("android")) return true;
+  return false;
 };
 
-const ANDROID_VIDEO_INITIAL_RANGE_BYTES = 1024 * 1024; // 1MB
+const ANDROID_VIDEO_INITIAL_RANGE_BYTES = 512 * 1024; // 512KB
 
 // 小 Range 内存缓存：专门服务 Android/WebDAV 视频播放器反复探测头部/尾部的小片段。
 // 不缓存大段（例如 bytes=48-文件末尾），避免内存/磁盘压力。
 const VIDEO_RANGE_CACHE_MAX_BYTES = 4 * 1024 * 1024; // 单片最大 4MB
 const VIDEO_RANGE_CACHE_MAX_ENTRIES = 96;
 const videoRangeCache = new Map(); // key -> { bytes: Uint8Array, ts: number }
+
+// MP4 moov/索引常在文件尾。Media3 会连续请求最后几 MB 的多个 1MB Range。
+// 对尾部窗口做一次性缓存，避免每一小段都重新走 Telegram 拉流。
+const VIDEO_TAIL_WINDOW_CACHE_BYTES = 8 * 1024 * 1024; // 8MB
+const VIDEO_TAIL_WINDOW_CACHE_MAX_ENTRIES = 16;
+const videoTailWindowCache = new Map(); // key -> { start: number, end: number, bytes: Uint8Array, ts: number }
+
+const getVideoTailWindowCacheKey = (descriptor, channel) => {
+  if (channel !== STREAMING_CHANNELS.WEBDAV) return null;
+  const path = descriptor?.__streamingPath || "";
+  const size = Number(descriptor?.size);
+  if (!Number.isFinite(size) || size <= 0) return null;
+  if (!isLikelyVideoPath(path) && !(String(descriptor?.contentType || "").toLowerCase().startsWith("video/"))) return null;
+  return `${path}|${size}|tail-window|${descriptor?.etag || ""}`;
+};
+
+const getTailWindowRange = (descriptor) => {
+  const size = Number(descriptor?.size);
+  if (!Number.isFinite(size) || size <= 0) return null;
+  const start = Math.max(0, size - VIDEO_TAIL_WINDOW_CACHE_BYTES);
+  return { start, end: size - 1, isSatisfiable: true };
+};
+
+const isRangeInsideTailWindow = (descriptor, range) => {
+  const tail = getTailWindowRange(descriptor);
+  if (!tail) return false;
+  return Number(range?.start) >= tail.start && Number(range?.end) <= tail.end;
+};
+
+const rememberVideoTailWindowCache = (key, windowRange, bytes) => {
+  if (!key || !windowRange || !bytes || bytes.byteLength <= 0) return;
+  if (videoTailWindowCache.has(key)) videoTailWindowCache.delete(key);
+  videoTailWindowCache.set(key, { ...windowRange, bytes, ts: Date.now() });
+  while (videoTailWindowCache.size > VIDEO_TAIL_WINDOW_CACHE_MAX_ENTRIES) {
+    const oldest = videoTailWindowCache.keys().next().value;
+    if (!oldest) break;
+    videoTailWindowCache.delete(oldest);
+  }
+};
+
+const sliceBytesFromTailWindow = (cached, range) => {
+  if (!cached || !cached.bytes) return null;
+  const start = Number(range?.start);
+  const end = Number(range?.end);
+  if (start < cached.start || end > cached.end || end < start) return null;
+  const offset = start - cached.start;
+  const len = end - start + 1;
+  return cached.bytes.slice(offset, offset + len);
+};
 
 const getVideoRangeCacheKey = (descriptor, range, channel) => {
   if (channel !== STREAMING_CHANNELS.WEBDAV) return null;
@@ -94,7 +146,8 @@ const getVideoRangeCacheKey = (descriptor, range, channel) => {
   if (len <= 0 || len > VIDEO_RANGE_CACHE_MAX_BYTES) return null;
 
   // 只缓存典型探测片段：文件头部小段，或文件尾部小段。
-  const isHeadProbe = start === 0 || start <= 128;
+  // Media3/ExoPlayer 解析 MP4 时常从 171、4946 等小偏移开始补读，不能只认 start<=128。
+  const isHeadProbe = start === 0 || start <= 8 * 1024;
   const isTailProbe = end === size - 1 && len <= VIDEO_RANGE_CACHE_MAX_BYTES;
   if (!isHeadProbe && !isTailProbe) return null;
 
@@ -830,8 +883,55 @@ export class StorageStreaming {
           };
         }
 
+        // 尾部窗口缓存：优先命中最后 8MB，解决 MP4 moov 在尾部时 Media3 连续扫尾导致的流量暴涨。
+        const tailWindowKey = getVideoTailWindowCacheKey(descriptor, channel);
+        if (tailWindowKey && isRangeInsideTailWindow(descriptor, range) && videoTailWindowCache.has(tailWindowKey)) {
+          const cachedTail = videoTailWindowCache.get(tailWindowKey);
+          videoTailWindowCache.delete(tailWindowKey);
+          videoTailWindowCache.set(tailWindowKey, cachedTail);
+          const bytes = sliceBytesFromTailWindow(cachedTail, range);
+          if (bytes) {
+            console.log(`[StorageStreaming][video-tail-cache] HIT ${descriptor.__streamingPath || ""} ${start}-${end} window=${cachedTail.start}-${cachedTail.end} bytes=${bytes.byteLength}`);
+            return {
+              stream: streamFromBytes(bytes),
+              supportsRange: true,
+              async close() {},
+            };
+          }
+        }
+
         // 优先使用驱动原生 Range 支持
         if (typeof descriptor.getRange === "function") {
+          // 如果请求位于尾部窗口内，先尝试一次性拉取并缓存最后 8MB，然后从缓存切片返回当前 Range。
+          if (tailWindowKey && isRangeInsideTailWindow(descriptor, range) && !videoTailWindowCache.has(tailWindowKey)) {
+            const tailRange = getTailWindowRange(descriptor);
+            try {
+              const tailHandle = await descriptor.getRange(tailRange);
+              const tailSupportsRange = tailHandle?.supportsRange !== false;
+              if (tailSupportsRange) {
+                const tailBytes = await readSmallStreamToBytes(tailHandle.stream, VIDEO_TAIL_WINDOW_CACHE_BYTES);
+                await tailHandle?.close?.();
+                if (tailBytes && tailBytes.byteLength > 0) {
+                  rememberVideoTailWindowCache(tailWindowKey, tailRange, tailBytes);
+                  console.log(`[StorageStreaming][video-tail-cache] MISS->STORE ${descriptor.__streamingPath || ""} window=${tailRange.start}-${tailRange.end} bytes=${tailBytes.byteLength}`);
+                  const bytes = sliceBytesFromTailWindow(videoTailWindowCache.get(tailWindowKey), range);
+                  if (bytes) {
+                    console.log(`[StorageStreaming][video-tail-cache] SERVE ${descriptor.__streamingPath || ""} ${start}-${end} bytes=${bytes.byteLength}`);
+                    return {
+                      stream: streamFromBytes(bytes),
+                      supportsRange: true,
+                      async close() {},
+                    };
+                  }
+                }
+              } else {
+                await tailHandle?.close?.();
+              }
+            } catch (e) {
+              console.warn(`[StorageStreaming][video-tail-cache] store failed ${descriptor.__streamingPath || ""} ${start}-${end}: ${e?.message || String(e)}`);
+            }
+          }
+
           streamHandle = await descriptor.getRange(range);
 
           // 关键检测：驱动是否真正支持 Range 请求

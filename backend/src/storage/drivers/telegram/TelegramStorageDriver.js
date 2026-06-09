@@ -494,11 +494,23 @@ export class TelegramStorageDriver extends BaseDriver {
                     });
                   }
 
-                  // Telegram 文件服务可能忽略 Range，仍返回 200 全量，此时用软件切片兜底
-                  const bodyStream =
-                    (localStart > 0 || localEnd < part.size - 1) && resp.status !== 206
-                      ? smartWrapStreamWithByteSlice(resp.body, localStart, localEnd)
-                      : resp.body;
+                  const requestedRange = localStart > 0 || localEnd < part.size - 1;
+                  if (requestedRange && resp.status !== 206) {
+                    // 对 telegram-bot-api 来说，Range 被忽略并返回 200 时，继续软件切片会迫使 botapi/TDLib
+                    // 在后台下载大段甚至整个大文件。播放端取消后，上游仍可能持续跑流量。
+                    // 因此这里直接取消上游并返回错误，避免“伪 Range”拖出站流量。
+                    try {
+                      await resp.body?.cancel?.();
+                    } catch {}
+                    throw new DriverError("TELEGRAM Range 未生效，拒绝全量下载兜底", {
+                      status: ApiStatus.BAD_GATEWAY,
+                      code: "DRIVER_ERROR.TELEGRAM_RANGE_NOT_SUPPORTED",
+                      expose: false,
+                      details: { status: resp.status, partNo: part.partNo, localStart, localEnd },
+                    });
+                  }
+
+                  const bodyStream = resp.body;
 
                   const reader = bodyStream.getReader();
                   while (true) {
