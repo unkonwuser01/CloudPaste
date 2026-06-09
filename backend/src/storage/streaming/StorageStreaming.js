@@ -91,11 +91,23 @@ const VIDEO_TAIL_WINDOW_CACHE_BYTES = 8 * 1024 * 1024; // 8MB
 const VIDEO_TAIL_WINDOW_CACHE_MAX_ENTRIES = 16;
 const videoTailWindowCache = new Map(); // key -> { start: number, end: number, bytes: Uint8Array, ts: number }
 
+const descriptorHasMtprotoLargePart = (descriptor) => {
+  const parts = Array.isArray(descriptor?.parts) ? descriptor.parts : [];
+  return parts.some((p) => p?.mtproto && Number(p?.size || 0) >= 100 * 1024 * 1024);
+};
+
 const getVideoTailWindowCacheKey = (descriptor, channel) => {
   if (channel !== STREAMING_CHANNELS.WEBDAV) return null;
+  // MTProto 本身已经支持精确 offset/limit；不要再做 8MB 尾部窗口预取，避免 upload.getFile LIMIT_INVALID。
+  if (descriptorHasMtprotoLargePart(descriptor)) return null;
   const path = descriptor?.__streamingPath || "";
   const size = Number(descriptor?.size);
   if (!Number.isFinite(size) || size <= 0) return null;
+  // 小视频小于尾部窗口时，tail window 会覆盖整个文件，导致首段请求先整文件预取，播放变慢。
+  // 只对真正存在“尾部窗口”的视频启用 tail-cache。
+  if (size <= VIDEO_TAIL_WINDOW_CACHE_BYTES) return null;
+  // Telegram 大视频走 MTProto 精确分片；禁用 8MB 尾部窗口预取，避免 upload.getFile LIMIT_INVALID。
+  if (path.startsWith("/tg/") && size >= 100 * 1024 * 1024) return null;
   if (!isLikelyVideoPath(path) && !(String(descriptor?.contentType || "").toLowerCase().startsWith("video/"))) return null;
   return `${path}|${size}|tail-window|${descriptor?.etag || ""}`;
 };

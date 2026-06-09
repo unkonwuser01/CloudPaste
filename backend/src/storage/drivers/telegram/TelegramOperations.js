@@ -85,8 +85,12 @@ export function normalizePartList(manifest) {
       partNo: Number(p?.partNo ?? p?.part_no ?? p?.part ?? ((Number.isFinite(Number(p?.part_index)) ? Number(p?.part_index) : index) + 1)),
       size: Number(p?.size),
       fileId: p?.file_id ?? p?.fileId ?? null,
+      fileUniqueId: p?.file_unique_id ?? p?.fileUniqueId ?? null,
       messageId: p?.message_id ?? p?.messageId ?? p?.telegram_message_id ?? null,
       chatId: p?.chat_id ?? p?.chatId ?? p?.target_chat_id ?? manifestChatId ?? null,
+      filename: p?.filename ?? p?.file_name ?? p?.original_filename ?? null,
+      mimeType: p?.mime_type ?? p?.mimeType ?? null,
+      mtproto: p?.mtproto ?? null,
     }))
     .filter((p) => Number.isFinite(p.partNo) && p.partNo > 0 && p.fileId);
 }

@@ -37,12 +37,15 @@ import {
 } from "./TelegramOperations.js";
 import { resolveOwner } from "../../fs/utils/OwnerResolver.js";
 import { smartWrapStreamWithByteSlice } from "../../streaming/ByteSliceStream.js";
+import { TelegramClient, Api } from "telegram";
+import { StringSession } from "telegram/sessions/index.js";
 
 const VFS_STORAGE_PATH_PREFIX = "vfs:";
 // 直传限制（share/表单/非分片 FS 上传）
 // - official（未勾选自建）：按“能下载/能预览”的最保守限制走（20MB）
 // - self_hosted（勾选自建）：不做硬限制
 const TELEGRAM_DIRECT_UPLOAD_MAX_BYTES_OFFICIAL = 20 * 1024 * 1024;
+const TELEGRAM_MTPROTO_RANGE_MIN_BYTES = 100 * 1024 * 1024;
 
 // 调试用：展示TG代理上游地址
 function maskTelegramBotTokenInUrl(url) {
@@ -89,6 +92,12 @@ export class TelegramStorageDriver extends BaseDriver {
     this.uploadConcurrency = 2;
     // 上传后校验（发完再 getFile 校验 file_size，避免“回执成功但文件坏/大小不对”）
     this.verifyAfterUpload = true;
+    this.mtprotoApiId = null;
+    this.mtprotoApiHash = null;
+    this.mtprotoClient = null;
+    this.mtprotoClientPromise = null;
+    this.mtprotoEntityCache = new Map();
+    this.mtprotoDocumentCache = new Map();
 
     // ========== MULTIPART 能力委托 ==========
     this.uploadOps = new TelegramMultipartOperations(this);
@@ -103,6 +112,8 @@ export class TelegramStorageDriver extends BaseDriver {
     const uploadConcurrency = Number(this.config?.upload_concurrency ?? 2);
     const botApiMode = String(this.config?.bot_api_mode || "official").trim().toLowerCase();
     const verifyAfterUpload = this.config?.verify_after_upload;
+    const mtprotoApiIdRaw = this.config?.telegram_api_id ?? this.config?.api_id ?? process.env.TELEGRAM_API_ID;
+    const mtprotoApiHashRaw = this.config?.telegram_api_hash ?? this.config?.api_hash ?? process.env.TELEGRAM_API_HASH;
 
     if (!botToken || typeof botToken !== "string") {
       throw new DriverError("TELEGRAM 驱动缺少必填配置 bot_token", {
@@ -135,6 +146,16 @@ export class TelegramStorageDriver extends BaseDriver {
     this.directUploadMaxBytes = this.botApiMode === "self_hosted" ? Infinity : TELEGRAM_DIRECT_UPLOAD_MAX_BYTES_OFFICIAL;
     this.uploadConcurrency = Number.isFinite(uploadConcurrency) && uploadConcurrency > 0 ? Math.floor(uploadConcurrency) : 2;
     this.verifyAfterUpload = verifyAfterUpload === false ? false : true;
+    this.mtprotoApiId = Number(mtprotoApiIdRaw || 0) || null;
+    this.mtprotoApiHash = mtprotoApiHashRaw ? String(mtprotoApiHashRaw).trim() : null;
+    if (this.mtprotoApiId && this.mtprotoApiHash && this.botToken) {
+      // 预热 MTProto bot 连接，避免第一次大视频 Range 播放时才登录/迁移 DC，导致 Media3 等不到首段而断开成 206/0。
+      setTimeout(() => {
+        this._getMtprotoClient().catch((e) => {
+          console.warn(`[TELEGRAM][mtproto] prewarm failed: ${e?.message || String(e)}`);
+        });
+      }, 500);
+    }
 
     // 官方托管 Bot API 下，分片太大可能出现“能传不能下”的坑
     // - self_hosted 模式不限制
@@ -291,6 +312,121 @@ export class TelegramStorageDriver extends BaseDriver {
       mount_id: mount?.id ?? null,
       storage_type: mount?.storage_type || this.type,
       items,
+    };
+  }
+
+  async _getMtprotoClient() {
+    if (!this.mtprotoApiId || !this.mtprotoApiHash || !this.botToken) return null;
+    if (this.mtprotoClient?.connected) return this.mtprotoClient;
+    if (this.mtprotoClientPromise) return this.mtprotoClientPromise;
+
+    this.mtprotoClientPromise = (async () => {
+      const client = new TelegramClient(new StringSession(""), this.mtprotoApiId, this.mtprotoApiHash, {
+        connectionRetries: 5,
+        requestRetries: 3,
+        retryDelay: 750,
+      });
+      await client.start({ botAuthToken: this.botToken });
+      this.mtprotoClient = client;
+      console.log("[TELEGRAM][mtproto] bot client connected");
+      return client;
+    })();
+
+    try {
+      return await this.mtprotoClientPromise;
+    } finally {
+      this.mtprotoClientPromise = null;
+    }
+  }
+
+  async _getMtprotoEntity(client, chatId) {
+    const key = String(chatId);
+    if (this.mtprotoEntityCache.has(key)) return this.mtprotoEntityCache.get(key);
+    const entity = await client.getEntity(BigInt(key));
+    this.mtprotoEntityCache.set(key, entity);
+    return entity;
+  }
+
+  async _getMtprotoDocument(client, mtproto) {
+    const chatId = mtproto?.chat_id ?? mtproto?.chatId;
+    const messageId = Number(mtproto?.message_id ?? mtproto?.messageId ?? 0);
+    if (!chatId || !messageId) return null;
+    const cacheKey = `${chatId}:${messageId}`;
+    if (this.mtprotoDocumentCache.has(cacheKey)) return this.mtprotoDocumentCache.get(cacheKey);
+
+    const entity = await this._getMtprotoEntity(client, chatId);
+    const messages = await client.getMessages(entity, { ids: [messageId] });
+    const msg = Array.isArray(messages) ? messages[0] : messages;
+    const doc = msg?.media?.document || null;
+    if (!doc) return null;
+    this.mtprotoDocumentCache.set(cacheKey, doc);
+    while (this.mtprotoDocumentCache.size > 256) {
+      const first = this.mtprotoDocumentCache.keys().next().value;
+      if (!first) break;
+      this.mtprotoDocumentCache.delete(first);
+    }
+    return doc;
+  }
+
+  async _downloadMtprotoRange(part, range, options = {}) {
+    const mtproto = part?.mtproto;
+    if (!mtproto) return null;
+    const partSize = Number(part?.size || 0);
+    if (!Number.isFinite(partSize) || partSize < TELEGRAM_MTPROTO_RANGE_MIN_BYTES) return null;
+    const client = await this._getMtprotoClient();
+    if (!client) return null;
+    const doc = await this._getMtprotoDocument(client, mtproto);
+    if (!doc?.id || !doc?.accessHash || !doc?.fileReference) return null;
+
+    const requestedStart = Number(range?.start || 0);
+    const requestedEnd = Number.isFinite(Number(range?.end)) ? Number(range.end) : Math.max(0, Number(part?.size || 0) - 1);
+    if (!Number.isFinite(requestedStart) || !Number.isFinite(requestedEnd) || requestedEnd < requestedStart) return null;
+
+    const align = 4096;
+    const alignedStart = Math.max(0, Math.floor(requestedStart / align) * align);
+    // 不要把尾部 Range 向上对齐到文件大小之外，否则 upload.getFile 会返回 LIMIT_INVALID。
+    const alignedEnd = Math.min(
+      Math.max(0, partSize - 1),
+      Math.ceil((requestedEnd + 1) / align) * align - 1,
+    );
+    const maxChunk = 512 * 1024;
+    const chunks = [];
+    let offset = alignedStart;
+
+    const location = new Api.InputDocumentFileLocation({
+      id: doc.id,
+      accessHash: doc.accessHash,
+      fileReference: doc.fileReference,
+      thumbSize: "",
+    });
+
+    while (offset <= alignedEnd) {
+      if (options?.signal?.aborted) throw new Error("MTProto range aborted");
+      const limit = Math.min(maxChunk, alignedEnd - offset + 1);
+      const res = await client.invoke(new Api.upload.GetFile({ location, offset, limit }));
+      const buf = Buffer.from(res?.bytes || []);
+      if (!buf.length) break;
+      chunks.push(buf);
+      if (buf.length < limit) break;
+      offset += buf.length;
+    }
+
+    const merged = Buffer.concat(chunks);
+    const sliceStart = requestedStart - alignedStart;
+    const sliceEnd = sliceStart + (requestedEnd - requestedStart + 1);
+    const sliced = merged.subarray(sliceStart, Math.min(sliceEnd, merged.length));
+    if (!sliced.length) return null;
+
+    console.log(`[TELEGRAM][mtproto-range] ${part.filename || part.file_name || part.partNo || "part"} ${requestedStart}-${requestedEnd} bytes=${sliced.length}`);
+    return {
+      stream: new ReadableStream({
+        start(controller) {
+          controller.enqueue(sliced);
+          controller.close();
+        },
+      }),
+      supportsRange: true,
+      async close() {},
     };
   }
 
@@ -494,6 +630,33 @@ export class TelegramStorageDriver extends BaseDriver {
                   if (aborter.signal.aborted) break;
                   const localStart = Math.max(0, startByte - part.startOffset);
                   const localEnd = Math.min(part.size - 1, endByte - part.startOffset);
+
+                  const preferMtproto = part?.mtproto && Number(part?.size || 0) >= TELEGRAM_MTPROTO_RANGE_MIN_BYTES;
+                  const mtprotoHandle = await driver._downloadMtprotoRange(part, { start: localStart, end: localEnd }, { signal: aborter.signal }).catch((e) => {
+                    console.warn(`[TELEGRAM][mtproto-range] fallback part=${part.partNo} ${localStart}-${localEnd}: ${e?.message || String(e)}`);
+                    if (preferMtproto) throw e;
+                    return null;
+                  });
+                  if (mtprotoHandle?.stream) {
+                    const reader = mtprotoHandle.stream.getReader();
+                    activeReaders.add(reader);
+                    try {
+                      while (true) {
+                        if (aborter.signal.aborted) {
+                          await reader.cancel?.("mtproto-range-aborted");
+                          break;
+                        }
+                        const { value, done } = await reader.read();
+                        if (done) break;
+                        if (value) controller.enqueue(value);
+                      }
+                    } finally {
+                      activeReaders.delete(reader);
+                      await mtprotoHandle.close?.().catch?.(() => {});
+                      try { reader.releaseLock?.(); } catch {}
+                    }
+                    continue;
+                  }
 
                   const downloadUrl = await driver._getFileDownloadUrl(part.fileId, { signal: aborter.signal });
                   const headers = new Headers();
