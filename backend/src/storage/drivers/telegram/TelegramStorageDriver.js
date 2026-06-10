@@ -41,6 +41,7 @@ import { TelegramClient, Api } from "telegram";
 import { StringSession } from "telegram/sessions/index.js";
 import fs from "node:fs";
 import path from "node:path";
+import crypto from "node:crypto";
 
 const VFS_STORAGE_PATH_PREFIX = "vfs:";
 // 直传限制（share/表单/非分片 FS 上传）
@@ -48,6 +49,8 @@ const VFS_STORAGE_PATH_PREFIX = "vfs:";
 // - self_hosted（勾选自建）：不做硬限制
 const TELEGRAM_DIRECT_UPLOAD_MAX_BYTES_OFFICIAL = 20 * 1024 * 1024;
 const TELEGRAM_MTPROTO_RANGE_MIN_BYTES = 100 * 1024 * 1024;
+const TELEGRAM_MTPROTO_BLOCK_CACHE_MAX_ENTRIES = 64;
+const TELEGRAM_MTPROTO_BLOCK_DISK_CACHE_DIR = process.env.TELEGRAM_MTPROTO_RANGE_CACHE_DIR || "/range-cache";
 
 // 调试用：展示TG代理上游地址
 function maskTelegramBotTokenInUrl(url) {
@@ -100,6 +103,9 @@ export class TelegramStorageDriver extends BaseDriver {
     this.mtprotoClientPromise = null;
     this.mtprotoEntityCache = new Map();
     this.mtprotoDocumentCache = new Map();
+    this.mtprotoBlockCache = new Map();
+    this.mtprotoBlockInflight = new Map();
+    this.mtprotoBlockDiskCacheDir = TELEGRAM_MTPROTO_BLOCK_DISK_CACHE_DIR;
     this.mtprotoDisabledUntilMs = 0;
 
     // ========== MULTIPART 能力委托 ==========
@@ -407,6 +413,95 @@ export class TelegramStorageDriver extends BaseDriver {
     return doc;
   }
 
+  _getMtprotoBlockCacheKey(part, mtproto, offset, limit) {
+    const chatId = mtproto?.chat_id ?? mtproto?.chatId ?? "";
+    const messageId = mtproto?.message_id ?? mtproto?.messageId ?? "";
+    const docId = mtproto?.document_id ?? mtproto?.documentId ?? "";
+    const unique = part?.file_unique_id || part?.fileUniqueId || part?.filename || part?.file_name || "";
+    return `${chatId}:${messageId}:${docId}:${unique}:${offset}:${limit}`;
+  }
+
+  _getMtprotoBlockDiskPath(key) {
+    const digest = crypto.createHash("sha256").update(String(key)).digest("hex");
+    return path.join(this.mtprotoBlockDiskCacheDir, digest.slice(0, 2), `${digest}.bin`);
+  }
+
+  _rememberMtprotoBlock(key, buf) {
+    if (!buf?.length) return;
+    this.mtprotoBlockCache.set(key, buf);
+    while (this.mtprotoBlockCache.size > TELEGRAM_MTPROTO_BLOCK_CACHE_MAX_ENTRIES) {
+      const first = this.mtprotoBlockCache.keys().next().value;
+      if (!first) break;
+      this.mtprotoBlockCache.delete(first);
+    }
+  }
+
+  async _readMtprotoBlockFromDisk(key) {
+    try {
+      const filePath = this._getMtprotoBlockDiskPath(key);
+      const buf = await fs.promises.readFile(filePath);
+      if (buf?.length) {
+        this._rememberMtprotoBlock(key, buf);
+        return buf;
+      }
+    } catch (e) {
+      if (e?.code !== "ENOENT") {
+        console.warn(`[TELEGRAM][mtproto-cache] read failed: ${e?.message || e}`);
+      }
+    }
+    return null;
+  }
+
+  async _writeMtprotoBlockToDisk(key, buf) {
+    if (!buf?.length) return;
+    try {
+      const filePath = this._getMtprotoBlockDiskPath(key);
+      await fs.promises.mkdir(path.dirname(filePath), { recursive: true });
+      const tmpPath = `${filePath}.${process.pid}.${Date.now()}.tmp`;
+      await fs.promises.writeFile(tmpPath, buf);
+      await fs.promises.rename(tmpPath, filePath).catch(async (e) => {
+        if (e?.code === "EEXIST") {
+          await fs.promises.unlink(tmpPath).catch(() => {});
+          return;
+        }
+        throw e;
+      });
+    } catch (e) {
+      console.warn(`[TELEGRAM][mtproto-cache] write failed: ${e?.message || e}`);
+    }
+  }
+
+  async _getMtprotoBlock(client, request, cacheKey, options = {}) {
+    const cached = this.mtprotoBlockCache.get(cacheKey);
+    if (cached) {
+      // refresh LRU order
+      this.mtprotoBlockCache.delete(cacheKey);
+      this.mtprotoBlockCache.set(cacheKey, cached);
+      return cached;
+    }
+    const diskCached = await this._readMtprotoBlockFromDisk(cacheKey);
+    if (diskCached) return diskCached;
+    if (this.mtprotoBlockInflight.has(cacheKey)) {
+      return await this.mtprotoBlockInflight.get(cacheKey);
+    }
+    const promise = (async () => {
+      if (options?.signal?.aborted) throw new Error("MTProto range aborted");
+      const res = options?.dcId > 0
+        ? await client.invoke(request, options.dcId)
+        : await client.invoke(request);
+      const buf = Buffer.from(res?.bytes || []);
+      this._rememberMtprotoBlock(cacheKey, buf);
+      await this._writeMtprotoBlockToDisk(cacheKey, buf);
+      return buf;
+    })();
+    this.mtprotoBlockInflight.set(cacheKey, promise);
+    try {
+      return await promise;
+    } finally {
+      this.mtprotoBlockInflight.delete(cacheKey);
+    }
+  }
+
   async _downloadMtprotoRange(part, range, options = {}) {
     const mtproto = part?.mtproto;
     if (!mtproto) return null;
@@ -447,10 +542,8 @@ export class TelegramStorageDriver extends BaseDriver {
       const limit = maxChunk;
       const request = new Api.upload.GetFile({ location, offset, limit });
       const dcId = Number(mtproto?.dc_id ?? mtproto?.dcId ?? doc?.dcId ?? 0);
-      const res = dcId > 0
-        ? await client.invoke(request, dcId)
-        : await client.invoke(request);
-      const buf = Buffer.from(res?.bytes || []);
+      const cacheKey = this._getMtprotoBlockCacheKey(part, mtproto, offset, limit);
+      const buf = await this._getMtprotoBlock(client, request, cacheKey, { signal: options?.signal, dcId });
       if (!buf.length) break;
       chunks.push(buf);
       if (buf.length < limit) break;

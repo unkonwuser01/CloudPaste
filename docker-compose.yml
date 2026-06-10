@@ -45,10 +45,12 @@ services:
       - TELEGRAM_LONG_REQUEST_TIMEOUT_MS=1800000
       - TELEGRAM_API_ID=${TELEGRAM_API_ID}
       - TELEGRAM_API_HASH=${TELEGRAM_API_HASH}
+      - TELEGRAM_MTPROTO_RANGE_CACHE_DIR=/range-cache
     volumes:
       - /etc/localtime:/etc/localtime:ro
       - /etc/timezone:/etc/timezone:ro
       - ./sql_data:/data
+      - /mnt/tg-botapi-cache/cloudpaste-range-cache:/range-cache
     networks:
       - cloudpaste-network
     restart: unless-stopped
