@@ -39,6 +39,8 @@ import { resolveOwner } from "../../fs/utils/OwnerResolver.js";
 import { smartWrapStreamWithByteSlice } from "../../streaming/ByteSliceStream.js";
 import { TelegramClient, Api } from "telegram";
 import { StringSession } from "telegram/sessions/index.js";
+import fs from "node:fs";
+import path from "node:path";
 
 const VFS_STORAGE_PATH_PREFIX = "vfs:";
 // 直传限制（share/表单/非分片 FS 上传）
@@ -98,6 +100,7 @@ export class TelegramStorageDriver extends BaseDriver {
     this.mtprotoClientPromise = null;
     this.mtprotoEntityCache = new Map();
     this.mtprotoDocumentCache = new Map();
+    this.mtprotoDisabledUntilMs = 0;
 
     // ========== MULTIPART 能力委托 ==========
     this.uploadOps = new TelegramMultipartOperations(this);
@@ -148,14 +151,7 @@ export class TelegramStorageDriver extends BaseDriver {
     this.verifyAfterUpload = verifyAfterUpload === false ? false : true;
     this.mtprotoApiId = Number(mtprotoApiIdRaw || 0) || null;
     this.mtprotoApiHash = mtprotoApiHashRaw ? String(mtprotoApiHashRaw).trim() : null;
-    if (this.mtprotoApiId && this.mtprotoApiHash && this.botToken) {
-      // 预热 MTProto bot 连接，避免第一次大视频 Range 播放时才登录/迁移 DC，导致 Media3 等不到首段而断开成 206/0。
-      setTimeout(() => {
-        this._getMtprotoClient().catch((e) => {
-          console.warn(`[TELEGRAM][mtproto] prewarm failed: ${e?.message || String(e)}`);
-        });
-      }, 500);
-    }
+    // 不再启动时预热 MTProto。Telegram bot auth 有 FloodWait 风险；按需懒连接更安全。
 
     // 官方托管 Bot API 下，分片太大可能出现“能传不能下”的坑
     // - self_hosted 模式不限制
@@ -315,18 +311,51 @@ export class TelegramStorageDriver extends BaseDriver {
     };
   }
 
+  _getMtprotoSessionPath() {
+    const dir = process.env.DATA_DIR || "/data";
+    return path.join(dir, "telegram-mtproto-bot.session");
+  }
+
+  _readMtprotoSessionString() {
+    const explicit = this.config?.mtproto_session || process.env.TELEGRAM_MTPROTO_SESSION;
+    if (explicit && String(explicit).trim()) return String(explicit).trim();
+    try {
+      const file = this._getMtprotoSessionPath();
+      if (fs.existsSync(file)) return fs.readFileSync(file, "utf8").trim();
+    } catch (e) {
+      console.warn(`[TELEGRAM][mtproto] read session failed: ${e?.message || String(e)}`);
+    }
+    return "";
+  }
+
+  _writeMtprotoSessionString(sessionString) {
+    if (!sessionString || this.config?.mtproto_session || process.env.TELEGRAM_MTPROTO_SESSION) return;
+    try {
+      const file = this._getMtprotoSessionPath();
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.writeFileSync(file, `${sessionString}\n`, { mode: 0o600 });
+      console.log(`[TELEGRAM][mtproto] session saved: ${file}`);
+    } catch (e) {
+      console.warn(`[TELEGRAM][mtproto] save session failed: ${e?.message || String(e)}`);
+    }
+  }
+
   async _getMtprotoClient() {
     if (!this.mtprotoApiId || !this.mtprotoApiHash || !this.botToken) return null;
+    if (this.mtprotoDisabledUntilMs && Date.now() < this.mtprotoDisabledUntilMs) return null;
     if (this.mtprotoClient?.connected) return this.mtprotoClient;
     if (this.mtprotoClientPromise) return this.mtprotoClientPromise;
 
     this.mtprotoClientPromise = (async () => {
-      const client = new TelegramClient(new StringSession(""), this.mtprotoApiId, this.mtprotoApiHash, {
+      const session = new StringSession(this._readMtprotoSessionString());
+      const client = new TelegramClient(session, this.mtprotoApiId, this.mtprotoApiHash, {
         connectionRetries: 5,
         requestRetries: 3,
         retryDelay: 750,
       });
       await client.start({ botAuthToken: this.botToken });
+      const saved = client.session?.save?.();
+      if (saved) this._writeMtprotoSessionString(saved);
       this.mtprotoClient = client;
       console.log("[TELEGRAM][mtproto] bot client connected");
       return client;
@@ -334,6 +363,16 @@ export class TelegramStorageDriver extends BaseDriver {
 
     try {
       return await this.mtprotoClientPromise;
+    } catch (e) {
+      const seconds = Number(e?.seconds || 0);
+      const msg = String(e?.errorMessage || e?.message || e || "");
+      if (seconds > 0 || msg.includes("FLOOD") || msg.includes("wait of")) {
+        const waitMs = Math.max(seconds || 300, 300) * 1000;
+        this.mtprotoDisabledUntilMs = Date.now() + waitMs;
+        console.warn(`[TELEGRAM][mtproto] disabled by floodwait for ${Math.round(waitMs / 1000)}s: ${msg}`);
+        return null;
+      }
+      throw e;
     } finally {
       this.mtprotoClientPromise = null;
     }
@@ -382,14 +421,15 @@ export class TelegramStorageDriver extends BaseDriver {
     const requestedEnd = Number.isFinite(Number(range?.end)) ? Number(range.end) : Math.max(0, Number(part?.size || 0) - 1);
     if (!Number.isFinite(requestedStart) || !Number.isFinite(requestedEnd) || requestedEnd < requestedStart) return null;
 
-    const align = 4096;
+    const maxChunk = 1024 * 1024;
+    // upload.getFile 对 offset/limit 对齐很敏感；内部用同尺寸子块时，offset 也按子块对齐。
+    const align = maxChunk;
     const alignedStart = Math.max(0, Math.floor(requestedStart / align) * align);
     // 不要把尾部 Range 向上对齐到文件大小之外，否则 upload.getFile 会返回 LIMIT_INVALID。
     const alignedEnd = Math.min(
       Math.max(0, partSize - 1),
       Math.ceil((requestedEnd + 1) / align) * align - 1,
     );
-    const maxChunk = 512 * 1024;
     const chunks = [];
     let offset = alignedStart;
 
@@ -402,8 +442,14 @@ export class TelegramStorageDriver extends BaseDriver {
 
     while (offset <= alignedEnd) {
       if (options?.signal?.aborted) throw new Error("MTProto range aborted");
-      const limit = Math.min(maxChunk, alignedEnd - offset + 1);
-      const res = await client.invoke(new Api.upload.GetFile({ location, offset, limit }));
+      // Telegram/GramJS 对 limit 同样敏感：尾块使用非对齐 limit 容易 LIMIT_INVALID。
+      // 因此内部固定请求对齐块，再在本地按客户端 Range 裁剪。
+      const limit = maxChunk;
+      const request = new Api.upload.GetFile({ location, offset, limit });
+      const dcId = Number(mtproto?.dc_id ?? mtproto?.dcId ?? doc?.dcId ?? 0);
+      const res = dcId > 0
+        ? await client.invoke(request, dcId)
+        : await client.invoke(request);
       const buf = Buffer.from(res?.bytes || []);
       if (!buf.length) break;
       chunks.push(buf);
@@ -633,8 +679,13 @@ export class TelegramStorageDriver extends BaseDriver {
 
                   const preferMtproto = part?.mtproto && Number(part?.size || 0) >= TELEGRAM_MTPROTO_RANGE_MIN_BYTES;
                   const mtprotoHandle = await driver._downloadMtprotoRange(part, { start: localStart, end: localEnd }, { signal: aborter.signal }).catch((e) => {
-                    console.warn(`[TELEGRAM][mtproto-range] fallback part=${part.partNo} ${localStart}-${localEnd}: ${e?.message || String(e)}`);
-                    if (preferMtproto) throw e;
+                    const msg = e?.message || String(e);
+                    console.warn(`[TELEGRAM][mtproto-range] fallback part=${part.partNo} ${localStart}-${localEnd}: ${msg}`);
+                    // Some Telegram documents live in a different DC. GramJS upload.getFile can surface this as
+                    // "file ... stored in DC N"; do not break the already-started WebDAV 206 stream. Fall back to
+                    // the local Bot API file endpoint, which may still support HTTP Range for this file.
+                    const canFallback = /stored in DC|FILE_MIGRATE|USER_MIGRATE|NETWORK_MIGRATE|PHONE_MIGRATE/i.test(msg);
+                    if (preferMtproto && !canFallback) throw e;
                     return null;
                   });
                   if (mtprotoHandle?.stream) {
@@ -718,6 +769,7 @@ export class TelegramStorageDriver extends BaseDriver {
                 }
                 if (!aborter.signal.aborted) controller.close();
               } catch (e) {
+                console.error(`[TELEGRAM][getRange-stream-error] ${e?.stack || e?.message || String(e)}`);
                 if (aborter.signal.aborted) {
                   try {
                     controller.close();
