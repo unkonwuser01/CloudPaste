@@ -442,6 +442,7 @@ export class TelegramStorageDriver extends BaseDriver {
       const buf = await fs.promises.readFile(filePath);
       if (buf?.length) {
         this._rememberMtprotoBlock(key, buf);
+        console.log(`[TELEGRAM][mtproto-cache] disk hit bytes=${buf.length}`);
         return buf;
       }
     } catch (e) {
@@ -466,6 +467,7 @@ export class TelegramStorageDriver extends BaseDriver {
         }
         throw e;
       });
+      console.log(`[TELEGRAM][mtproto-cache] disk write bytes=${buf.length}`);
     } catch (e) {
       console.warn(`[TELEGRAM][mtproto-cache] write failed: ${e?.message || e}`);
     }
