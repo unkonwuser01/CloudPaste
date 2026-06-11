@@ -57,6 +57,10 @@ const TELEGRAM_MTPROTO_PREFETCH_BLOCK_CONCURRENCY = Math.max(1, Math.min(8, Numb
 const TELEGRAM_MTPROTO_PREFETCH_MIN_TRIGGER_BYTES = Math.max(1, Number(process.env.TELEGRAM_MTPROTO_PREFETCH_MIN_TRIGGER_KB || 256) || 256) * 1024;
 const TELEGRAM_MTPROTO_PREFETCH_ALIGN_BYTES = 1024 * 1024;
 const TELEGRAM_MTPROTO_PREFETCH_SEEK_RESET_BYTES = Math.max(TELEGRAM_MTPROTO_PREFETCH_BYTES * 2, 64 * 1024 * 1024);
+const TELEGRAM_SMALL_VIDEO_PREWARM_MAX_BYTES = Math.max(0, Number(process.env.TELEGRAM_SMALL_VIDEO_PREWARM_MAX_MB || 100) || 0) * 1024 * 1024;
+const TELEGRAM_SMALL_VIDEO_PREWARM_MIN_BYTES = Math.max(0, Number(process.env.TELEGRAM_SMALL_VIDEO_PREWARM_MIN_KB || 256) || 0) * 1024;
+const TELEGRAM_SMALL_VIDEO_PREWARM_CONCURRENCY = Math.max(1, Math.min(4, Number(process.env.TELEGRAM_SMALL_VIDEO_PREWARM_CONCURRENCY || 1) || 1));
+const TELEGRAM_SMALL_VIDEO_PREWARM_COOLDOWN_MS = Math.max(0, Number(process.env.TELEGRAM_SMALL_VIDEO_PREWARM_COOLDOWN_SEC || 600) || 0) * 1000;
 
 // 调试用：展示TG代理上游地址
 function maskTelegramBotTokenInUrl(url) {
@@ -112,6 +116,8 @@ export class TelegramStorageDriver extends BaseDriver {
     this.mtprotoBlockCache = new Map();
     this.mtprotoBlockInflight = new Map();
     this.mtprotoPrefetchInflight = new Map();
+    this.smallVideoPrewarmInflight = new Map();
+    this.smallVideoPrewarmDoneAt = new Map();
     this.mtprotoBlockDiskCacheDir = TELEGRAM_MTPROTO_BLOCK_DISK_CACHE_DIR;
     this.mtprotoDisabledUntilMs = 0;
 
@@ -509,6 +515,92 @@ export class TelegramStorageDriver extends BaseDriver {
     } finally {
       this.mtprotoBlockInflight.delete(cacheKey);
     }
+  }
+
+  _scheduleSmallVideoPrewarm(part, range, options = {}) {
+    if (!TELEGRAM_SMALL_VIDEO_PREWARM_MAX_BYTES) return;
+    const fileId = part?.fileId;
+    const partSize = Number(part?.size || 0);
+    if (!fileId || !Number.isFinite(partSize) || partSize <= 0) return;
+    if (partSize >= TELEGRAM_MTPROTO_RANGE_MIN_BYTES || partSize > TELEGRAM_SMALL_VIDEO_PREWARM_MAX_BYTES) return;
+
+    const requestedStart = Number(range?.start || 0);
+    const requestedEnd = Number(range?.end);
+    if (!Number.isFinite(requestedStart) || !Number.isFinite(requestedEnd)) return;
+    const requestedLength = requestedEnd - requestedStart + 1;
+    if (requestedLength < TELEGRAM_SMALL_VIDEO_PREWARM_MIN_BYTES) return;
+
+    const key = `${fileId}:${partSize}`;
+    if (this.smallVideoPrewarmInflight.has(key)) return;
+    const doneAt = this.smallVideoPrewarmDoneAt.get(key) || 0;
+    if (TELEGRAM_SMALL_VIDEO_PREWARM_COOLDOWN_MS && Date.now() - doneAt < TELEGRAM_SMALL_VIDEO_PREWARM_COOLDOWN_MS) return;
+    if (this.smallVideoPrewarmInflight.size >= TELEGRAM_SMALL_VIDEO_PREWARM_CONCURRENCY) return;
+
+    const aborter = new AbortController();
+    this.smallVideoPrewarmInflight.set(key, aborter);
+    console.log(`[TELEGRAM][small-prewarm] schedule part=${part.partNo || "?"} bytes=${partSize}`);
+    setTimeout(() => {
+      this._prewarmSmallVideo(part, { signal: aborter.signal })
+        .then((bytes) => {
+          this.smallVideoPrewarmDoneAt.set(key, Date.now());
+          if (this.smallVideoPrewarmDoneAt.size > 1000) {
+            const cutoff = Date.now() - Math.max(TELEGRAM_SMALL_VIDEO_PREWARM_COOLDOWN_MS, 60 * 1000);
+            for (const [doneKey, ts] of this.smallVideoPrewarmDoneAt.entries()) {
+              if (ts < cutoff) this.smallVideoPrewarmDoneAt.delete(doneKey);
+            }
+          }
+          console.log(`[TELEGRAM][small-prewarm] done part=${part.partNo || "?"} bytes=${bytes}`);
+        })
+        .catch((e) => {
+          const msg = e?.message || String(e);
+          if (aborter.signal.aborted || /aborted/i.test(msg)) {
+            console.log(`[TELEGRAM][small-prewarm] aborted part=${part.partNo || "?"}`);
+          } else {
+            console.warn(`[TELEGRAM][small-prewarm] failed part=${part.partNo || "?"}: ${msg}`);
+          }
+        })
+        .finally(() => {
+          this.smallVideoPrewarmInflight.delete(key);
+        });
+    }, 0);
+  }
+
+  async _prewarmSmallVideo(part, options = {}) {
+    const fileId = part?.fileId;
+    const partSize = Number(part?.size || 0);
+    if (!fileId || !Number.isFinite(partSize) || partSize <= 0) return 0;
+    if (options?.signal?.aborted) throw new Error("small video prewarm aborted");
+    const downloadUrl = await this._getFileDownloadUrl(fileId, { signal: options?.signal });
+    const resp = await this._fetchTelegramDownloadResponse(
+      downloadUrl,
+      { method: "GET" },
+      { signal: options?.signal, partNo: part.partNo },
+    );
+    if (!resp.ok || !resp.body) {
+      throw new DriverError("TELEGRAM 小视频预热下载失败", {
+        status: ApiStatus.BAD_GATEWAY,
+        code: "DRIVER_ERROR.TELEGRAM_SMALL_PREWARM_FAILED",
+        expose: false,
+        details: { status: resp.status, partNo: part.partNo },
+      });
+    }
+
+    let bytes = 0;
+    const reader = resp.body.getReader();
+    try {
+      while (true) {
+        if (options?.signal?.aborted) {
+          await reader.cancel?.("small-video-prewarm-aborted");
+          break;
+        }
+        const { value, done } = await reader.read();
+        if (done) break;
+        bytes += value?.byteLength || value?.length || 0;
+      }
+    } finally {
+      try { reader.releaseLock?.(); } catch {}
+    }
+    return bytes;
   }
 
   _scheduleMtprotoPrefetch(part, range, options = {}) {
@@ -948,6 +1040,7 @@ export class TelegramStorageDriver extends BaseDriver {
                   }
 
                   const downloadUrl = await driver._getFileDownloadUrl(part.fileId, { signal: aborter.signal });
+                  const shouldPrewarmSmallVideo = !preferMtproto;
                   const headers = new Headers();
                   // 先尝试 Range（如果 Telegram 文件服务支持，会返回 206，省流量）
                   if (localStart > 0 || localEnd < part.size - 1) {
@@ -1003,6 +1096,9 @@ export class TelegramStorageDriver extends BaseDriver {
                     try {
                       reader.releaseLock?.();
                     } catch {}
+                  }
+                  if (!aborter.signal.aborted && shouldPrewarmSmallVideo) {
+                    driver._scheduleSmallVideoPrewarm(part, { start: localStart, end: localEnd });
                   }
                 }
                 if (!aborter.signal.aborted) controller.close();
