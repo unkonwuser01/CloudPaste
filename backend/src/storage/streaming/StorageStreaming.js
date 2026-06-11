@@ -606,6 +606,7 @@ export class StorageStreaming {
         // - 因此：对视频场景的大 start，先探测上游是否真的支持 Range；不支持就直接忽略 Range 返回 200
         //   （这样至少不会把带宽打爆；但该上游本身也无法真正支持拖动）
         if (
+          !descriptor?.trustedNativeRange &&
           range.start > VIDEO_SOFTWARE_SLICE_MAX_START_BYTES &&
           isVideoLikeRequest(request, descriptor, path)
         ) {

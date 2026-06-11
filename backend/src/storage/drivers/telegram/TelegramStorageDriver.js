@@ -51,6 +51,12 @@ const TELEGRAM_DIRECT_UPLOAD_MAX_BYTES_OFFICIAL = 20 * 1024 * 1024;
 const TELEGRAM_MTPROTO_RANGE_MIN_BYTES = 100 * 1024 * 1024;
 const TELEGRAM_MTPROTO_BLOCK_CACHE_MAX_ENTRIES = 64;
 const TELEGRAM_MTPROTO_BLOCK_DISK_CACHE_DIR = process.env.TELEGRAM_MTPROTO_RANGE_CACHE_DIR || "/range-cache";
+const TELEGRAM_MTPROTO_PREFETCH_BYTES = Math.max(0, Number(process.env.TELEGRAM_MTPROTO_PREFETCH_MB || 64) || 0) * 1024 * 1024;
+const TELEGRAM_MTPROTO_PREFETCH_MAX_CONCURRENT = Math.max(1, Number(process.env.TELEGRAM_MTPROTO_PREFETCH_MAX_CONCURRENT || 1) || 1);
+const TELEGRAM_MTPROTO_PREFETCH_BLOCK_CONCURRENCY = Math.max(1, Math.min(8, Number(process.env.TELEGRAM_MTPROTO_PREFETCH_BLOCK_CONCURRENCY || 4) || 4));
+const TELEGRAM_MTPROTO_PREFETCH_MIN_TRIGGER_BYTES = Math.max(1, Number(process.env.TELEGRAM_MTPROTO_PREFETCH_MIN_TRIGGER_KB || 256) || 256) * 1024;
+const TELEGRAM_MTPROTO_PREFETCH_ALIGN_BYTES = 1024 * 1024;
+const TELEGRAM_MTPROTO_PREFETCH_SEEK_RESET_BYTES = Math.max(TELEGRAM_MTPROTO_PREFETCH_BYTES * 2, 64 * 1024 * 1024);
 
 // 调试用：展示TG代理上游地址
 function maskTelegramBotTokenInUrl(url) {
@@ -105,6 +111,7 @@ export class TelegramStorageDriver extends BaseDriver {
     this.mtprotoDocumentCache = new Map();
     this.mtprotoBlockCache = new Map();
     this.mtprotoBlockInflight = new Map();
+    this.mtprotoPrefetchInflight = new Map();
     this.mtprotoBlockDiskCacheDir = TELEGRAM_MTPROTO_BLOCK_DISK_CACHE_DIR;
     this.mtprotoDisabledUntilMs = 0;
 
@@ -504,6 +511,136 @@ export class TelegramStorageDriver extends BaseDriver {
     }
   }
 
+  _scheduleMtprotoPrefetch(part, range, options = {}) {
+    if (!TELEGRAM_MTPROTO_PREFETCH_BYTES) return;
+    const mtproto = part?.mtproto;
+    if (!mtproto) return;
+    const partSize = Number(part?.size || 0);
+    if (!Number.isFinite(partSize) || partSize < TELEGRAM_MTPROTO_RANGE_MIN_BYTES) return;
+    const requestedStart = Number(range?.start || 0);
+    const requestedEnd = Number(range?.end);
+    if (!Number.isFinite(requestedStart) || !Number.isFinite(requestedEnd) || requestedEnd >= partSize - 1) return;
+    const requestedLength = requestedEnd - requestedStart + 1;
+    // StorageStreaming 会先发 1 字节 probe 来确认原生 Range 能力。
+    // 这种探测请求不能触发预读，否则会和随后真正的播放 Range 重叠并抢当前段带宽。
+    if (requestedLength < TELEGRAM_MTPROTO_PREFETCH_MIN_TRIGGER_BYTES) return;
+
+    // 预读不要从当前 Range 后的非对齐位置开始；MTProto block cache 是 1MiB 粒度，
+    // 如果向下对齐会抢当前播放段所在 block。这里主动向上对齐到下一个 1MiB block。
+    const start = Math.min(partSize - 1, Math.ceil((requestedEnd + 1) / TELEGRAM_MTPROTO_PREFETCH_ALIGN_BYTES) * TELEGRAM_MTPROTO_PREFETCH_ALIGN_BYTES);
+    const end = Math.min(partSize - 1, start + TELEGRAM_MTPROTO_PREFETCH_BYTES - 1);
+    if (end < start) return;
+
+    const chatId = mtproto?.chat_id ?? mtproto?.chatId ?? "";
+    const messageId = mtproto?.message_id ?? mtproto?.messageId ?? "";
+    const docId = mtproto?.document_id ?? mtproto?.documentId ?? "";
+    const key = `${chatId}:${messageId}:${docId}:${part?.partNo || ""}:${start}-${end}`;
+    if (this.mtprotoPrefetchInflight.has(key)) return;
+
+    const samePartPrefix = `${chatId}:${messageId}:${docId}:${part?.partNo || ""}:`;
+    const active = [...this.mtprotoPrefetchInflight.entries()].filter(([activeKey]) => activeKey.startsWith(samePartPrefix));
+    const overlapsActive = active.some(([, task]) => start <= task.end && end >= task.start);
+    if (overlapsActive) return;
+
+    if (this.mtprotoPrefetchInflight.size >= TELEGRAM_MTPROTO_PREFETCH_MAX_CONCURRENT) {
+      let cancelled = false;
+      for (const [activeKey, task] of this.mtprotoPrefetchInflight.entries()) {
+        const distance = Math.min(Math.abs(start - task.start), Math.abs(start - task.end));
+        if (activeKey.startsWith(samePartPrefix) && distance > TELEGRAM_MTPROTO_PREFETCH_SEEK_RESET_BYTES) {
+          console.log(`[TELEGRAM][mtproto-prefetch] cancel stale part=${part.partNo || "?"} ${task.start}-${task.end} for new ${start}-${end}`);
+          task.aborter?.abort?.();
+          this.mtprotoPrefetchInflight.delete(activeKey);
+          cancelled = true;
+        }
+      }
+      if (!cancelled && this.mtprotoPrefetchInflight.size >= TELEGRAM_MTPROTO_PREFETCH_MAX_CONCURRENT) return;
+    }
+
+    const aborter = new AbortController();
+    this.mtprotoPrefetchInflight.set(key, { start, end, aborter });
+    console.log(`[TELEGRAM][mtproto-prefetch] schedule part=${part.partNo || "?"} ${start}-${end} bytes=${end - start + 1}`);
+    setTimeout(() => {
+      this._prefetchMtprotoRange(part, { start, end }, { signal: aborter.signal })
+        .then((count) => {
+          console.log(`[TELEGRAM][mtproto-prefetch] done part=${part.partNo || "?"} ${start}-${end} blocks=${count}`);
+        })
+        .catch((e) => {
+          const msg = e?.message || String(e);
+          if (aborter.signal.aborted || /aborted/i.test(msg)) {
+            console.log(`[TELEGRAM][mtproto-prefetch] aborted part=${part.partNo || "?"} ${start}-${end}`);
+          } else {
+            console.warn(`[TELEGRAM][mtproto-prefetch] failed part=${part.partNo || "?"} ${start}-${end}: ${msg}`);
+          }
+        })
+        .finally(() => {
+          this.mtprotoPrefetchInflight.delete(key);
+        });
+    }, 0);
+  }
+
+  async _prefetchMtprotoRange(part, range, options = {}) {
+    const mtproto = part?.mtproto;
+    if (!mtproto) return 0;
+    const partSize = Number(part?.size || 0);
+    if (!Number.isFinite(partSize) || partSize < TELEGRAM_MTPROTO_RANGE_MIN_BYTES) return 0;
+    const client = await this._getMtprotoClient();
+    if (!client) return 0;
+    const doc = await this._getMtprotoDocument(client, mtproto);
+    if (!doc?.id || !doc?.accessHash || !doc?.fileReference) return 0;
+
+    const requestedStart = Number(range?.start || 0);
+    const requestedEnd = Number.isFinite(Number(range?.end)) ? Number(range.end) : Math.max(0, partSize - 1);
+    if (!Number.isFinite(requestedStart) || !Number.isFinite(requestedEnd) || requestedEnd < requestedStart) return 0;
+
+    const maxChunk = 1024 * 1024;
+    const align = maxChunk;
+    const alignedStart = Math.max(0, Math.floor(requestedStart / align) * align);
+    const alignedEnd = Math.min(Math.max(0, partSize - 1), Math.ceil((requestedEnd + 1) / align) * align - 1);
+    const location = new Api.InputDocumentFileLocation({
+      id: doc.id,
+      accessHash: doc.accessHash,
+      fileReference: doc.fileReference,
+      thumbSize: "",
+    });
+
+    const dcId = Number(mtproto?.dc_id ?? mtproto?.dcId ?? doc?.dcId ?? 0);
+    const jobs = [];
+    for (let offset = alignedStart; offset <= alignedEnd; offset += maxChunk) {
+      jobs.push(offset);
+    }
+
+    let nextIndex = 0;
+    let count = 0;
+    let sawShortBlock = false;
+    const worker = async () => {
+      while (nextIndex < jobs.length && !sawShortBlock) {
+        if (options?.signal?.aborted) throw new Error("MTProto prefetch aborted");
+        const offset = jobs[nextIndex++];
+        const limit = maxChunk;
+        const cacheKey = this._getMtprotoBlockCacheKey(part, mtproto, offset, limit);
+        if (this.mtprotoBlockCache.has(cacheKey)) continue;
+        const diskCached = await this._readMtprotoBlockFromDisk(cacheKey);
+        if (diskCached) continue;
+
+        const request = new Api.upload.GetFile({ location, offset, limit });
+        const buf = await this._getMtprotoBlock(client, request, cacheKey, { signal: options?.signal, dcId });
+        if (!buf.length) {
+          sawShortBlock = true;
+          break;
+        }
+        count += 1;
+        if (buf.length < limit) {
+          sawShortBlock = true;
+          break;
+        }
+      }
+    };
+
+    const workers = Array.from({ length: Math.min(TELEGRAM_MTPROTO_PREFETCH_BLOCK_CONCURRENCY, jobs.length) }, () => worker());
+    await Promise.all(workers);
+    return count;
+  }
+
   async _downloadMtprotoRange(part, range, options = {}) {
     const mtproto = part?.mtproto;
     if (!mtproto) return null;
@@ -679,6 +816,9 @@ export class TelegramStorageDriver extends BaseDriver {
       contentType,
       etag: null,
       lastModified,
+      // Telegram VFS 大文件已实现真正的原生 getRange；StorageStreaming 的大跳转 1-byte probe
+      // 对这里会造成每个播放分片额外一次 MTProto 请求与 abort，拖动播放时明显拖慢。
+      trustedNativeRange: true,
       async getStream() {
         const aborter = new AbortController();
         const stream = new ReadableStream({
@@ -800,6 +940,9 @@ export class TelegramStorageDriver extends BaseDriver {
                       activeReaders.delete(reader);
                       await mtprotoHandle.close?.().catch?.(() => {});
                       try { reader.releaseLock?.(); } catch {}
+                    }
+                    if (!aborter.signal.aborted && preferMtproto) {
+                      driver._scheduleMtprotoPrefetch(part, { start: localStart, end: localEnd });
                     }
                     continue;
                   }
